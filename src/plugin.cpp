@@ -11,10 +11,11 @@
 
 #if defined(__APPLE__)
 extern "C" {
-    void* chordGuiCreate(uint32_t w, uint32_t h);
+    typedef void (*ChordProviderFn)(void* userData, char* buf, size_t bufSize);
+    void* chordGuiCreate(uint32_t w, uint32_t h,
+                         ChordProviderFn provider, void* userData);
     void  chordGuiDestroy(void* view);
     bool  chordGuiSetParent(void* view, void* parentNSView);
-    void  chordGuiSetText(void* view, const char* text);
     void  chordGuiGetPreferredSize(uint32_t* w, uint32_t* h);
 }
 #endif
@@ -26,19 +27,29 @@ constexpr uint32_t kGuiHeight = 200;
 
 struct ChordAnalyzer {
     const clap_host_t* host = nullptr;
-    const clap_host_timer_support_t* hostTimer = nullptr;
-    clap_id timerId = CLAP_INVALID_ID;
 
     std::mutex notesMutex;
     std::set<int> notes;
-
-    std::string lastChord;
 
     void* guiView = nullptr;
     bool guiVisible = false;
 
     clap_plugin_t plugin{};
 };
+
+void fillChordString(void* userData, char* buf, size_t bufSize) {
+    if (!buf || bufSize == 0) return;
+    auto* self = static_cast<ChordAnalyzer*>(userData);
+    std::string s;
+    {
+        std::lock_guard<std::mutex> lk(self->notesMutex);
+        s = chord::detect(self->notes);
+    }
+    if (s.empty()) s = "—";
+    size_t n = s.size() < bufSize - 1 ? s.size() : bufSize - 1;
+    std::memcpy(buf, s.data(), n);
+    buf[n] = '\0';
+}
 
 // -------- helpers --------
 
@@ -78,22 +89,10 @@ void handleEvent(ChordAnalyzer* self, const clap_event_header_t* hdr) {
 
 // -------- plugin methods --------
 
-bool plugin_init(const clap_plugin_t* p) {
-    auto* self = static_cast<ChordAnalyzer*>(p->plugin_data);
-    self->hostTimer = static_cast<const clap_host_timer_support_t*>(
-        self->host->get_extension(self->host, CLAP_EXT_TIMER_SUPPORT));
-    if (self->hostTimer && self->hostTimer->register_timer) {
-        self->hostTimer->register_timer(self->host, 50, &self->timerId);
-    }
-    return true;
-}
+bool plugin_init(const clap_plugin_t*) { return true; }
 
 void plugin_destroy(const clap_plugin_t* p) {
     auto* self = static_cast<ChordAnalyzer*>(p->plugin_data);
-    if (self->hostTimer && self->timerId != CLAP_INVALID_ID) {
-        self->hostTimer->unregister_timer(self->host, self->timerId);
-        self->timerId = CLAP_INVALID_ID;
-    }
     delete self;
 }
 
@@ -192,31 +191,6 @@ bool state_load(const clap_plugin_t*, const clap_istream_t*) { return true; }
 
 constexpr clap_plugin_state_t kState = { state_save, state_load };
 
-// -------- extensions: timer support --------
-
-void timer_on_timer(const clap_plugin_t* p, clap_id timerId) {
-    auto* self = static_cast<ChordAnalyzer*>(p->plugin_data);
-    if (timerId != self->timerId) return;
-
-    std::string chord;
-    {
-        std::lock_guard<std::mutex> lk(self->notesMutex);
-        chord = chord::detect(self->notes);
-    }
-    if (chord.empty()) chord = "—";
-
-    if (chord != self->lastChord) {
-        self->lastChord = chord;
-#if defined(__APPLE__)
-        if (self->guiView) chordGuiSetText(self->guiView, chord.c_str());
-#endif
-    }
-}
-
-constexpr clap_plugin_timer_support_t kTimerSupport = {
-    timer_on_timer,
-};
-
 // -------- extensions: gui --------
 
 #if defined(__APPLE__)
@@ -242,10 +216,8 @@ bool gui_create(const clap_plugin_t* p, const char* api, bool is_floating) {
 #if defined(__APPLE__)
     auto* self = static_cast<ChordAnalyzer*>(p->plugin_data);
     if (!self->guiView) {
-        self->guiView = chordGuiCreate(kGuiWidth, kGuiHeight);
+        self->guiView = chordGuiCreate(kGuiWidth, kGuiHeight, &fillChordString, self);
         if (!self->guiView) return false;
-        chordGuiSetText(self->guiView,
-                        self->lastChord.empty() ? "—" : self->lastChord.c_str());
     }
     return true;
 #else
@@ -335,7 +307,6 @@ const void* plugin_get_extension(const clap_plugin_t*, const char* id) {
     if (std::strcmp(id, CLAP_EXT_NOTE_PORTS)     == 0) return &kNotePorts;
     if (std::strcmp(id, CLAP_EXT_AUDIO_PORTS)    == 0) return &kAudioPorts;
     if (std::strcmp(id, CLAP_EXT_STATE)          == 0) return &kState;
-    if (std::strcmp(id, CLAP_EXT_TIMER_SUPPORT)  == 0) return &kTimerSupport;
     if (std::strcmp(id, CLAP_EXT_GUI)            == 0) return &kGui;
     return nullptr;
 }
@@ -343,8 +314,9 @@ const void* plugin_get_extension(const clap_plugin_t*, const char* id) {
 // -------- descriptor --------
 
 const char* const kFeatures[] = {
-    CLAP_PLUGIN_FEATURE_NOTE_EFFECT,
     CLAP_PLUGIN_FEATURE_ANALYZER,
+    CLAP_PLUGIN_FEATURE_NOTE_EFFECT,
+    CLAP_PLUGIN_FEATURE_AUDIO_EFFECT,
     nullptr,
 };
 
