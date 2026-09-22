@@ -1,0 +1,5 @@
+build/
+_build/
+cmake-build-*/
+.DS_Store
+*.swp
