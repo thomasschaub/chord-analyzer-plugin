@@ -187,6 +187,86 @@ static inline bool isWhitePc(int pc) {
 @end
 
 // ------------------------------------------------------------
+// Pitch-class histogram subview
+// ------------------------------------------------------------
+
+static NSString* const kPcShortNames[12] = {
+    @"C", @"C♯", @"D", @"E♭", @"E", @"F", @"F♯", @"G", @"A♭", @"A", @"B♭", @"B",
+};
+
+@interface HistogramView : NSView
+@end
+
+@implementation HistogramView {
+    uint16_t _counts[12];
+    uint16_t _scaleMask;
+    int _scaleRoot;
+}
+
+- (BOOL)isFlipped { return YES; }
+
+- (void)updateCounts:(const uint16_t*)counts scaleMask:(uint16_t)mask root:(int)root {
+    if (std::memcmp(counts, _counts, sizeof(_counts)) == 0
+        && mask == _scaleMask && root == _scaleRoot) {
+        return;
+    }
+    std::memcpy(_counts, counts, sizeof(_counts));
+    _scaleMask = mask;
+    _scaleRoot = root;
+    [self setNeedsDisplay:YES];
+}
+
+- (void)drawRect:(NSRect)dirtyRect {
+    (void)dirtyRect;
+    NSRect b = self.bounds;
+
+    NSColor* panel     = [NSColor colorWithCalibratedRed:0.13 green:0.13 blue:0.16 alpha:1.0];
+    NSColor* barPlain  = [NSColor colorWithCalibratedWhite:0.42 alpha:1.0];
+    NSColor* barScale  = [NSColor colorWithCalibratedRed:0.72 green:0.90 blue:0.78 alpha:1.0];
+    NSColor* barRoot   = [NSColor colorWithCalibratedRed:0.42 green:0.93 blue:0.60 alpha:1.0];
+    NSColor* labelDim  = [NSColor colorWithCalibratedWhite:0.50 alpha:1.0];
+    NSColor* labelLit  = [NSColor colorWithCalibratedWhite:0.85 alpha:1.0];
+
+    [panel setFill];
+    [[NSBezierPath bezierPathWithRoundedRect:b xRadius:6 yRadius:6] fill];
+
+    uint16_t maxCount = 0;
+    for (uint16_t c : _counts) maxCount = std::max(maxCount, c);
+
+    CGFloat inset = 8;
+    CGFloat labelH = 14;
+    CGFloat colW = (b.size.width - inset * 2) / 12.0;
+    CGFloat barW = std::round(colW * 0.62);
+    CGFloat baseY = b.size.height - inset - labelH;
+    CGFloat maxBarH = baseY - inset;
+
+    NSFont* labelFont = [NSFont systemFontOfSize:10 weight:NSFontWeightMedium];
+    for (int pc = 0; pc < 12; ++pc) {
+        BOOL inScale = (_scaleMask >> pc) & 1;
+        BOOL isRoot = inScale && pc == _scaleRoot;
+        CGFloat colX = inset + pc * colW;
+
+        if (maxCount > 0 && _counts[pc] > 0) {
+            CGFloat h = std::max<CGFloat>(2, std::round(maxBarH * _counts[pc] / maxCount));
+            NSRect bar = NSMakeRect(std::round(colX + (colW - barW) * 0.5), baseY - h, barW, h);
+            [(isRoot ? barRoot : inScale ? barScale : barPlain) setFill];
+            [[NSBezierPath bezierPathWithRoundedRect:bar xRadius:2 yRadius:2] fill];
+        }
+
+        NSDictionary* attrs = @{
+            NSFontAttributeName: labelFont,
+            NSForegroundColorAttributeName: inScale ? labelLit : labelDim,
+        };
+        NSString* name = kPcShortNames[pc];
+        NSSize sz = [name sizeWithAttributes:attrs];
+        [name drawAtPoint:NSMakePoint(colX + (colW - sz.width) * 0.5, baseY + 2)
+           withAttributes:attrs];
+    }
+}
+
+@end
+
+// ------------------------------------------------------------
 // Container view: label stack + keyboard + polling timer
 // ------------------------------------------------------------
 
@@ -197,11 +277,16 @@ static inline bool isWhitePc(int pc) {
 @property(nonatomic, strong) NSTextField* scaleLabel;
 @property(nonatomic, strong) NSPopUpButton* rootPopup;
 @property(nonatomic, strong) NSPopUpButton* scaleTypePopup;
-@property(nonatomic, assign) ScaleChangedCallback scaleCallback;
+@property(nonatomic, strong) NSTextField* detectedTitleLabel;
+@property(nonatomic, strong) NSTextField* detectedNameLabel;
+@property(nonatomic, strong) NSButton* useDetectedButton;
+@property(nonatomic, strong) NSButton* resetHistoryButton;
+@property(nonatomic, strong) HistogramView* histogramView;
+@property(nonatomic, assign) int detectedRoot;
+@property(nonatomic, assign) int detectedType;
 @property(nonatomic, strong) NSTimer* pollTimer;
 @property(nonatomic, copy)   NSString* lastChordText;
-@property(nonatomic, assign) ChordSnapshotProvider provider;
-@property(nonatomic, assign) void* providerUserData;
+@property(nonatomic, assign) ChordGuiCallbacks callbacks;
 @end
 
 @implementation ChordAnalyzerView
@@ -221,6 +306,14 @@ static inline bool isWhitePc(int pc) {
     tf.cell.scrollable = NO;
     tf.lineBreakMode = NSLineBreakByClipping;
     return tf;
+}
+
+- (NSButton*)makeSmallButton:(NSString*)title action:(SEL)action {
+    NSButton* btn = [NSButton buttonWithTitle:title target:self action:action];
+    btn.bezelStyle = NSBezelStyleRounded;
+    btn.controlSize = NSControlSizeSmall;
+    btn.font = [NSFont systemFontOfSize:[NSFont smallSystemFontSize]];
+    return btn;
 }
 
 - (BOOL)isFlipped { return YES; }
@@ -278,6 +371,33 @@ static inline bool isWhitePc(int pc) {
 
         [self applyScaleRoot:0 type:0];
 
+        NSColor* dim = [NSColor colorWithCalibratedWhite:0.55 alpha:1.0];
+
+        _detectedTitleLabel = [ChordAnalyzerView
+            makeLabelWithFont:[NSFont systemFontOfSize:12 weight:NSFontWeightMedium] color:dim];
+        _detectedTitleLabel.alignment = NSTextAlignmentLeft;
+        _detectedTitleLabel.stringValue = @"Detected";
+        [self addSubview:_detectedTitleLabel];
+
+        _detectedNameLabel = [ChordAnalyzerView
+            makeLabelWithFont:[NSFont systemFontOfSize:13 weight:NSFontWeightSemibold]
+                        color:[NSColor whiteColor]];
+        _detectedNameLabel.alignment = NSTextAlignmentLeft;
+        [self addSubview:_detectedNameLabel];
+
+        _useDetectedButton = [self makeSmallButton:@"Use" action:@selector(useDetectedScale:)];
+        _useDetectedButton.toolTip = @"Select the detected scale";
+        [self addSubview:_useDetectedButton];
+
+        _resetHistoryButton = [self makeSmallButton:@"Reset" action:@selector(resetHistory:)];
+        _resetHistoryButton.toolTip = @"Clear the note histogram";
+        [self addSubview:_resetHistoryButton];
+
+        _histogramView = [[HistogramView alloc] initWithFrame:NSZeroRect];
+        [self addSubview:_histogramView];
+
+        [self updateDetectedRoot:0 type:0 early:NO historyCount:0];
+
         _lastChordText = @"—";
         [self relayout];
     }
@@ -295,17 +415,31 @@ static inline bool isWhitePc(int pc) {
     CGFloat kbH = 92;
     CGFloat rowH = 22;
     CGFloat rowGap = 8;
+    CGFloat histH = 80;
+    CGFloat sectionGap = 14;
 
     self.subtitleLabel.frame = NSMakeRect(0, pad, b.size.width, 16);
 
+    // Bottom-up: histogram, detection row, keyboard, scale row.
+    CGFloat histY = b.size.height - pad - histH;
+    CGFloat detectY = histY - 6 - rowH;
+    CGFloat kbY = detectY - sectionGap - kbH;
+    CGFloat rowY = kbY - rowGap - rowH;
+
     CGFloat chordY = pad + 22;
-    CGFloat chordH = b.size.height - chordY - kbH - rowH - rowGap - pad * 2;
+    CGFloat chordH = rowY - pad - chordY;
     if (chordH < 40) chordH = 40;
     self.chordLabel.frame = NSMakeRect(12, chordY, b.size.width - 24, chordH);
     [self resizeChordFontForText:self.chordLabel.stringValue];
 
-    CGFloat kbY = b.size.height - kbH - pad;
-    CGFloat rowY = kbY - rowGap - rowH;
+    CGFloat right = b.size.width - pad;
+    self.resetHistoryButton.frame = NSMakeRect(right - 60, detectY, 60, rowH);
+    self.useDetectedButton.frame  = NSMakeRect(right - 60 - 4 - 50, detectY, 50, rowH);
+    self.detectedTitleLabel.frame = NSMakeRect(pad, detectY + 3, 62, 16);
+    self.detectedNameLabel.frame  = NSMakeRect(pad + 62, detectY + 2,
+                                               NSMinX(self.useDetectedButton.frame) - 6 - pad - 62,
+                                               18);
+    self.histogramView.frame = NSMakeRect(pad, histY, b.size.width - pad * 2, histH);
     self.scaleLabel.frame     = NSMakeRect(pad, rowY + 3, 40, 16);
     self.rootPopup.frame      = NSMakeRect(pad + 40, rowY, 84, rowH);
     self.scaleTypePopup.frame = NSMakeRect(pad + 40 + 84 + 6, rowY, 140, rowH);
@@ -326,9 +460,50 @@ static inline bool isWhitePc(int pc) {
     int type = (int)self.scaleTypePopup.indexOfSelectedItem;
     if (root < 0 || type < 0) return;
     [self applyScaleRoot:root type:type];
-    if (self.scaleCallback) {
-        self.scaleCallback(self.providerUserData, (uint8_t)root, (uint8_t)type);
+    if (self.callbacks.setScale) {
+        self.callbacks.setScale(self.callbacks.userData, (uint8_t)root, (uint8_t)type);
     }
+}
+
+- (void)updateDetectedRoot:(int)root type:(int)type early:(BOOL)early historyCount:(int)count {
+    self.detectedRoot = root;
+    self.detectedType = type;
+
+    NSString* name;
+    if (type > 0) {
+        name = [NSString stringWithFormat:@"%s %s%@",
+                scale::kRootNames[root], scale::kTypes[type].name, early ? @"?" : @""];
+    } else if (count == 0) {
+        name = @"—";
+    } else {
+        name = @"Play more notes…";
+    }
+    if (![self.detectedNameLabel.stringValue isEqualToString:name]) {
+        self.detectedNameLabel.stringValue = name;
+        // Tentative guesses are dimmer than a full detection.
+        self.detectedNameLabel.textColor = type == 0 ? [NSColor colorWithCalibratedWhite:0.55 alpha:1.0]
+                                         : early     ? [NSColor colorWithCalibratedWhite:0.78 alpha:1.0]
+                                                     : [NSColor whiteColor];
+    }
+
+    self.useDetectedButton.enabled = type > 0;
+    self.resetHistoryButton.enabled = count > 0;
+}
+
+- (void)useDetectedScale:(id)sender {
+    (void)sender;
+    if (self.detectedType <= 0) return;
+    [self applyScaleRoot:self.detectedRoot type:self.detectedType];
+    if (self.callbacks.setScale) {
+        self.callbacks.setScale(self.callbacks.userData,
+                                (uint8_t)self.detectedRoot, (uint8_t)self.detectedType);
+    }
+}
+
+- (void)resetHistory:(id)sender {
+    (void)sender;
+    if (self.callbacks.resetHistory) self.callbacks.resetHistory(self.callbacks.userData);
+    [self pollTick];
 }
 
 - (void)resizeChordFontForText:(NSString*)text {
@@ -344,9 +519,8 @@ static inline bool isWhitePc(int pc) {
     self.chordLabel.font = font;
 }
 
-- (void)startPollingWithProvider:(ChordSnapshotProvider)provider userData:(void*)userData {
-    self.provider = provider;
-    self.providerUserData = userData;
+- (void)startPollingWithCallbacks:(ChordGuiCallbacks)callbacks {
+    self.callbacks = callbacks;
     if (self.pollTimer) return;
     __weak ChordAnalyzerView* weakSelf = self;
     self.pollTimer = [NSTimer scheduledTimerWithTimeInterval:0.06
@@ -358,10 +532,10 @@ static inline bool isWhitePc(int pc) {
 }
 
 - (void)pollTick {
-    if (!self.provider) return;
+    if (!self.callbacks.getSnapshot) return;
     ChordSnapshot snap;
     std::memset(&snap, 0, sizeof(snap));
-    self.provider(self.providerUserData, &snap);
+    self.callbacks.getSnapshot(self.callbacks.userData, &snap);
 
     NSString* s = [NSString stringWithUTF8String:snap.name];
     if (s.length == 0) s = @"—";
@@ -389,6 +563,17 @@ static inline bool isWhitePc(int pc) {
     if (snap.scaleRoot <= 11 && snap.scaleType < scale::kTypeCount) {
         [self applyScaleRoot:snap.scaleRoot type:snap.scaleType];
     }
+
+    int detRoot = snap.detectedRoot <= 11 ? snap.detectedRoot : 0;
+    int detType = snap.detectedType < scale::kTypeCount ? snap.detectedType : 0;
+    [self updateDetectedRoot:detRoot
+                        type:detType
+                       early:snap.detectedEarly != 0
+                historyCount:snap.historyCount];
+    // Bars are coloured by the detected scale, so the histogram shows how well it fits.
+    [self.histogramView updateCounts:snap.histogram
+                           scaleMask:scale::pitchClassMask(detRoot, detType)
+                                root:detRoot];
 }
 
 - (void)dealloc {
@@ -403,15 +588,11 @@ static inline bool isWhitePc(int pc) {
 
 extern "C" {
 
-void* chordGuiCreate(uint32_t w, uint32_t h,
-                     ChordSnapshotProvider provider,
-                     ScaleChangedCallback onScaleChanged,
-                     void* userData) {
+void* chordGuiCreate(uint32_t w, uint32_t h, ChordGuiCallbacks callbacks) {
     @autoreleasepool {
         NSRect frame = NSMakeRect(0, 0, w, h);
         ChordAnalyzerView* view = [[ChordAnalyzerView alloc] initWithFrame:frame];
-        view.scaleCallback = onScaleChanged;
-        [view startPollingWithProvider:provider userData:userData];
+        [view startPollingWithCallbacks:callbacks];
         return (__bridge_retained void*)view;
     }
 }
@@ -454,7 +635,7 @@ bool chordGuiSetParent(void* view, void* parentNSView) {
 
 void chordGuiGetPreferredSize(uint32_t* w, uint32_t* h) {
     if (w) *w = 440;
-    if (h) *h = 310;
+    if (h) *h = 420;
 }
 
 } // extern "C"

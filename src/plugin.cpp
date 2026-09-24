@@ -17,13 +17,21 @@
 namespace {
 
 constexpr uint32_t kGuiWidth  = 440;
-constexpr uint32_t kGuiHeight = 310;
+constexpr uint32_t kGuiHeight = 420;
+constexpr int kHistorySize = 100;
 
 struct ChordAnalyzer {
     const clap_host_t* host = nullptr;
 
     std::mutex notesMutex;
     std::set<int> notes;
+
+    // Ring buffer of the pitch classes of the last kHistorySize note-ons,
+    // plus a running per-pitch-class count. Guarded by notesMutex.
+    uint8_t  history[kHistorySize] = {};
+    int      historyHead = 0;
+    int      historyCount = 0;
+    uint16_t pcCounts[12] = {};
 
     std::atomic<uint8_t> scaleRoot{0};
     std::atomic<uint8_t> scaleType{0};
@@ -51,7 +59,14 @@ void fillChordSnapshot(void* userData, ChordSnapshot* out) {
             out->notes[count++] = static_cast<uint8_t>(n);
         }
         out->noteCount = count;
+
+        std::memcpy(out->histogram, self->pcCounts, sizeof(out->histogram));
+        out->historyCount = static_cast<uint16_t>(self->historyCount);
     }
+    scale::Detection d = scale::detect(out->histogram);
+    out->detectedRoot = static_cast<uint8_t>(d.root);
+    out->detectedType = static_cast<uint8_t>(d.type);
+    out->detectedEarly = d.early ? 1 : 0;
     if (r.name.empty()) r.name = "—";
     size_t n = r.name.size() < sizeof(out->name) - 1 ? r.name.size() : sizeof(out->name) - 1;
     std::memcpy(out->name, r.name.data(), n);
@@ -59,6 +74,14 @@ void fillChordSnapshot(void* userData, ChordSnapshot* out) {
     out->isChord = r.isChord ? 1 : 0;
     out->scaleRoot = self->scaleRoot.load();
     out->scaleType = self->scaleType.load();
+}
+
+void onResetHistory(void* userData) {
+    auto* self = static_cast<ChordAnalyzer*>(userData);
+    std::lock_guard<std::mutex> lk(self->notesMutex);
+    self->historyHead = 0;
+    self->historyCount = 0;
+    std::memset(self->pcCounts, 0, sizeof(self->pcCounts));
 }
 
 void onScaleChanged(void* userData, uint8_t root, uint8_t type) {
@@ -77,6 +100,19 @@ void onScaleChanged(void* userData, uint8_t root, uint8_t type) {
 
 // -------- helpers --------
 
+// Call with notesMutex held.
+void recordNoteOn(ChordAnalyzer* self, int key) {
+    uint8_t pc = static_cast<uint8_t>(((key % 12) + 12) % 12);
+    if (self->historyCount == kHistorySize) {
+        self->pcCounts[self->history[self->historyHead]]--;
+    } else {
+        self->historyCount++;
+    }
+    self->history[self->historyHead] = pc;
+    self->historyHead = (self->historyHead + 1) % kHistorySize;
+    self->pcCounts[pc]++;
+}
+
 void handleEvent(ChordAnalyzer* self, const clap_event_header_t* hdr) {
     if (hdr->space_id != CLAP_CORE_EVENT_SPACE_ID) return;
     switch (hdr->type) {
@@ -84,6 +120,7 @@ void handleEvent(ChordAnalyzer* self, const clap_event_header_t* hdr) {
             auto* ev = reinterpret_cast<const clap_event_note_t*>(hdr);
             std::lock_guard<std::mutex> lk(self->notesMutex);
             self->notes.insert(ev->key);
+            recordNoteOn(self, ev->key);
             break;
         }
         case CLAP_EVENT_NOTE_OFF:
@@ -101,6 +138,7 @@ void handleEvent(ChordAnalyzer* self, const clap_event_header_t* hdr) {
             std::lock_guard<std::mutex> lk(self->notesMutex);
             if (status == 0x90 && vel > 0) {
                 self->notes.insert(key);
+                recordNoteOn(self, key);
             } else if (status == 0x80 || (status == 0x90 && vel == 0)) {
                 self->notes.erase(key);
             }
@@ -270,8 +308,12 @@ bool gui_create(const clap_plugin_t* p, const char* api, bool is_floating) {
 #if defined(__APPLE__)
     auto* self = static_cast<ChordAnalyzer*>(p->plugin_data);
     if (!self->guiView) {
-        self->guiView = chordGuiCreate(kGuiWidth, kGuiHeight, &fillChordSnapshot,
-                                       &onScaleChanged, self);
+        ChordGuiCallbacks cb{};
+        cb.userData     = self;
+        cb.getSnapshot  = &fillChordSnapshot;
+        cb.setScale     = &onScaleChanged;
+        cb.resetHistory = &onResetHistory;
+        self->guiView = chordGuiCreate(kGuiWidth, kGuiHeight, cb);
         if (!self->guiView) return false;
     }
     return true;
