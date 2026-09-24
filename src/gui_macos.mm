@@ -92,12 +92,15 @@ static inline bool isWhitePc(int pc) {
     NSColor* blackFill  = [NSColor colorWithCalibratedRed:0.09 green:0.09 blue:0.12 alpha:1.0];
     NSColor* separator  = [NSColor colorWithCalibratedWhite:0.35 alpha:1.0];
     NSColor* octaveMark = [NSColor colorWithCalibratedWhite:0.55 alpha:1.0];
+    NSColor* blackOutline = [NSColor colorWithCalibratedRed:0.05 green:0.05 blue:0.07 alpha:1.0];
 
     // Soft green tint for keys that belong to the selected scale.
     NSColor* whiteScale = [NSColor colorWithCalibratedRed:0.72 green:0.90 blue:0.78 alpha:1.0];
     NSColor* blackScale = [NSColor colorWithCalibratedRed:0.18 green:0.42 blue:0.30 alpha:1.0];
-    NSColor* rootMarkOnWhite = [NSColor colorWithCalibratedRed:0.10 green:0.45 blue:0.25 alpha:1.0];
-    NSColor* rootMarkOnBlack = [NSColor colorWithCalibratedRed:0.70 green:0.95 blue:0.80 alpha:1.0];
+    // The scale root gets a stronger green plus a dot marker.
+    NSColor* whiteRoot  = [NSColor colorWithCalibratedRed:0.36 green:0.78 blue:0.52 alpha:1.0];
+    NSColor* blackRoot  = [NSColor colorWithCalibratedRed:0.42 green:0.93 blue:0.60 alpha:1.0];
+    NSColor* rootMark   = [NSColor colorWithCalibratedRed:0.04 green:0.24 blue:0.13 alpha:1.0];
 
     // Blue when a chord is recognized, amber when it's just individual notes.
     NSColor* whiteHeld;
@@ -119,13 +122,14 @@ static inline bool isWhitePc(int pc) {
         NSRect r = NSMakeRect(wi * whiteW, 0, whiteW, whiteH);
         BOOL held = [self.held containsIndex:(NSUInteger)n];
         BOOL inScale = [self inScale:pc];
-        [(held ? whiteHeld : inScale ? whiteScale : whiteFill) setFill];
+        BOOL isRoot = inScale && pc == self.scaleRoot;
+        [(held ? whiteHeld : isRoot ? whiteRoot : inScale ? whiteScale : whiteFill) setFill];
         NSRectFill(r);
-        if (inScale && pc == self.scaleRoot) {
+        if (isRoot) {
             // Sit the marker above the octave label so they don't collide.
             NSRect markerArea = r;
             if (pc == 0) markerArea.size.height -= 12;
-            [self drawRootMarkerInRect:markerArea color:rootMarkOnWhite];
+            [self drawRootMarkerInRect:markerArea color:rootMark];
         }
 
         // Subtle "C" marker under each C key
@@ -160,14 +164,22 @@ static inline bool isWhitePc(int pc) {
         int pc = n % 12;
         if (isWhitePc(pc)) { wi++; continue; }
 
-        CGFloat x = wi * whiteW - blackW * 0.5;
-        NSRect r = NSMakeRect(x, 0, blackW, blackH);
+        // Pixel-align so the 1pt outline stays crisp.
+        CGFloat x = std::round(wi * whiteW - blackW * 0.5);
+        NSRect r = NSMakeRect(x, 0, std::round(blackW), std::round(blackH));
         BOOL held = [self.held containsIndex:(NSUInteger)n];
         BOOL inScale = [self inScale:pc];
-        [(held ? blackHeld : inScale ? blackScale : blackFill) setFill];
+        BOOL isRoot = inScale && pc == self.scaleRoot;
+        [(held ? blackHeld : isRoot ? blackRoot : inScale ? blackScale : blackFill) setFill];
         NSRectFill(r);
-        if (inScale && pc == self.scaleRoot) {
-            [self drawRootMarkerInRect:r color:rootMarkOnBlack];
+
+        // Dark contour so a highlighted black key doesn't blend into
+        // highlighted white keys next to it.
+        [blackOutline setFill];
+        NSFrameRect(r);
+
+        if (isRoot) {
+            [self drawRootMarkerInRect:r color:rootMark];
         }
     }
 }
