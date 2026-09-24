@@ -8,22 +8,16 @@
 #include <string>
 
 #include "chord_detector.hpp"
+#include "scale.hpp"
 
 #if defined(__APPLE__)
-extern "C" {
-    typedef void (*ChordProviderFn)(void* userData, char* buf, size_t bufSize);
-    void* chordGuiCreate(uint32_t w, uint32_t h,
-                         ChordProviderFn provider, void* userData);
-    void  chordGuiDestroy(void* view);
-    bool  chordGuiSetParent(void* view, void* parentNSView);
-    void  chordGuiGetPreferredSize(uint32_t* w, uint32_t* h);
-}
+#include "gui_api.h"
 #endif
 
 namespace {
 
-constexpr uint32_t kGuiWidth  = 380;
-constexpr uint32_t kGuiHeight = 200;
+constexpr uint32_t kGuiWidth  = 440;
+constexpr uint32_t kGuiHeight = 310;
 
 struct ChordAnalyzer {
     const clap_host_t* host = nullptr;
@@ -31,25 +25,55 @@ struct ChordAnalyzer {
     std::mutex notesMutex;
     std::set<int> notes;
 
+    std::atomic<uint8_t> scaleRoot{0};
+    std::atomic<uint8_t> scaleType{0};
+
     void* guiView = nullptr;
     bool guiVisible = false;
 
     clap_plugin_t plugin{};
 };
 
-void fillChordString(void* userData, char* buf, size_t bufSize) {
-    if (!buf || bufSize == 0) return;
+#if defined(__APPLE__)
+void fillChordSnapshot(void* userData, ChordSnapshot* out) {
+    if (!out) return;
+    std::memset(out, 0, sizeof(*out));
     auto* self = static_cast<ChordAnalyzer*>(userData);
-    std::string s;
+
+    chord::Result r;
     {
         std::lock_guard<std::mutex> lk(self->notesMutex);
-        s = chord::detect(self->notes);
+        r = chord::detect(self->notes);
+        uint8_t count = 0;
+        for (int n : self->notes) {
+            if (count >= sizeof(out->notes)) break;
+            if (n < 0 || n > 127) continue;
+            out->notes[count++] = static_cast<uint8_t>(n);
+        }
+        out->noteCount = count;
     }
-    if (s.empty()) s = "—";
-    size_t n = s.size() < bufSize - 1 ? s.size() : bufSize - 1;
-    std::memcpy(buf, s.data(), n);
-    buf[n] = '\0';
+    if (r.name.empty()) r.name = "—";
+    size_t n = r.name.size() < sizeof(out->name) - 1 ? r.name.size() : sizeof(out->name) - 1;
+    std::memcpy(out->name, r.name.data(), n);
+    out->name[n] = '\0';
+    out->isChord = r.isChord ? 1 : 0;
+    out->scaleRoot = self->scaleRoot.load();
+    out->scaleType = self->scaleType.load();
 }
+
+void onScaleChanged(void* userData, uint8_t root, uint8_t type) {
+    auto* self = static_cast<ChordAnalyzer*>(userData);
+    if (root > 11 || type >= scale::kTypeCount) return;
+    if (self->scaleRoot.load() == root && self->scaleType.load() == type) return;
+    self->scaleRoot.store(root);
+    self->scaleType.store(type);
+
+    // Let the host know the project has unsaved changes.
+    auto* hostState = static_cast<const clap_host_state_t*>(
+        self->host->get_extension(self->host, CLAP_EXT_STATE));
+    if (hostState && hostState->mark_dirty) hostState->mark_dirty(self->host);
+}
+#endif
 
 // -------- helpers --------
 
@@ -184,10 +208,40 @@ constexpr clap_plugin_audio_ports_t kAudioPorts = {
 };
 
 // -------- extensions: state --------
-// Nothing meaningful to persist; save/load empty payload so hosts are happy.
+// Layout: [version][scaleRoot][scaleType]
 
-bool state_save(const clap_plugin_t*, const clap_ostream_t*) { return true; }
-bool state_load(const clap_plugin_t*, const clap_istream_t*) { return true; }
+constexpr uint8_t kStateVersion = 1;
+
+bool state_save(const clap_plugin_t* p, const clap_ostream_t* stream) {
+    auto* self = static_cast<ChordAnalyzer*>(p->plugin_data);
+    const uint8_t data[3] = { kStateVersion, self->scaleRoot.load(), self->scaleType.load() };
+    int64_t written = 0;
+    while (written < (int64_t)sizeof(data)) {
+        int64_t n = stream->write(stream, data + written, sizeof(data) - written);
+        if (n <= 0) return false;
+        written += n;
+    }
+    return true;
+}
+
+bool state_load(const clap_plugin_t* p, const clap_istream_t* stream) {
+    auto* self = static_cast<ChordAnalyzer*>(p->plugin_data);
+    uint8_t data[3] = {};
+    int64_t got = 0;
+    while (got < (int64_t)sizeof(data)) {
+        int64_t n = stream->read(stream, data + got, sizeof(data) - got);
+        if (n < 0) return false;
+        if (n == 0) break;
+        got += n;
+    }
+    // Older sessions saved an empty state; keep defaults.
+    if (got == 0) return true;
+    if (got < (int64_t)sizeof(data) || data[0] != kStateVersion) return false;
+    if (data[1] > 11 || data[2] >= scale::kTypeCount) return false;
+    self->scaleRoot.store(data[1]);
+    self->scaleType.store(data[2]);
+    return true;
+}
 
 constexpr clap_plugin_state_t kState = { state_save, state_load };
 
@@ -216,7 +270,8 @@ bool gui_create(const clap_plugin_t* p, const char* api, bool is_floating) {
 #if defined(__APPLE__)
     auto* self = static_cast<ChordAnalyzer*>(p->plugin_data);
     if (!self->guiView) {
-        self->guiView = chordGuiCreate(kGuiWidth, kGuiHeight, &fillChordString, self);
+        self->guiView = chordGuiCreate(kGuiWidth, kGuiHeight, &fillChordSnapshot,
+                                       &onScaleChanged, self);
         if (!self->guiView) return false;
     }
     return true;

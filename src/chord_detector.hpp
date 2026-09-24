@@ -80,35 +80,27 @@ inline std::string intervalName(int semitones) {
     }
 }
 
+struct Result {
+    std::string name;
+    bool isChord = false;   // true when a pattern from patterns() matched
+};
+
 // midiNotes is a sorted set of MIDI note numbers currently held.
-// Returns an empty string when no notes are held.
-inline std::string detect(const std::set<int>& midiNotes) {
-    if (midiNotes.empty()) return "";
+// Returns an empty name when no notes are held.
+inline Result detect(const std::set<int>& midiNotes) {
+    Result out;
+    if (midiNotes.empty()) return out;
 
     if (midiNotes.size() == 1) {
         int n = *midiNotes.begin();
-        std::string s = pcName(n % 12);
-        s += std::to_string((n / 12) - 1);
-        return s;
+        out.name = pcName(n % 12);
+        out.name += std::to_string((n / 12) - 1);
+        return out;
     }
 
     std::set<int> pcs;
     for (int n : midiNotes) pcs.insert(((n % 12) + 12) % 12);
     int bassPc = ((*midiNotes.begin() % 12) + 12) % 12;
-
-    if (midiNotes.size() == 2 && pcs.size() == 2) {
-        auto it = pcs.begin();
-        int a = *it++;
-        int b = *it;
-        int upDist = (b - a + 12) % 12;
-        int downDist = (a - b + 12) % 12;
-        int lowPc = (upDist <= downDist) ? a : b;
-        int gap = (upDist <= downDist) ? upDist : downDist;
-        std::string s = pcName(lowPc);
-        s += " + ";
-        s += intervalName(gap);
-        return s;
-    }
 
     struct Match {
         int rootPc = -1;
@@ -135,24 +127,40 @@ inline std::string detect(const std::set<int>& midiNotes) {
         }
     }
 
-    if (best.rootPc < 0) {
-        std::string s;
-        bool first = true;
-        for (int pc : pcs) {
-            if (!first) s += " ";
-            first = false;
-            s += pcName(pc);
+    if (best.rootPc >= 0) {
+        out.name = pcName(best.rootPc);
+        out.name += best.suffix;
+        if (bassPc != best.rootPc) {
+            out.name += "/";
+            out.name += pcName(bassPc);
         }
-        return s;
+        out.isChord = true;
+        return out;
     }
 
-    std::string result = pcName(best.rootPc);
-    result += best.suffix;
-    if (bassPc != best.rootPc) {
-        result += "/";
-        result += pcName(bassPc);
+    // No chord matched — for a plain dyad, show it as "root + interval".
+    if (pcs.size() == 2) {
+        auto it = pcs.begin();
+        int a = *it++;
+        int b = *it;
+        int upDist = (b - a + 12) % 12;
+        int downDist = (a - b + 12) % 12;
+        int lowPc = (upDist <= downDist) ? a : b;
+        int gap = (upDist <= downDist) ? upDist : downDist;
+        out.name = pcName(lowPc);
+        out.name += " + ";
+        out.name += intervalName(gap);
+        return out;
     }
-    return result;
+
+    // Fallback: list the pitch classes.
+    bool first = true;
+    for (int pc : pcs) {
+        if (!first) out.name += " ";
+        first = false;
+        out.name += pcName(pc);
+    }
+    return out;
 }
 
 } // namespace chord
