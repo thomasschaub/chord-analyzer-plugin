@@ -190,10 +190,6 @@ static inline bool isWhitePc(int pc) {
 // Pitch-class histogram subview
 // ------------------------------------------------------------
 
-static NSString* const kPcShortNames[12] = {
-    @"C", @"C♯", @"D", @"E♭", @"E", @"F", @"F♯", @"G", @"A♭", @"A", @"B♭", @"B",
-};
-
 @interface HistogramView : NSView
 @end
 
@@ -257,7 +253,7 @@ static NSString* const kPcShortNames[12] = {
             NSFontAttributeName: labelFont,
             NSForegroundColorAttributeName: inScale ? labelLit : labelDim,
         };
-        NSString* name = kPcShortNames[pc];
+        NSString* name = [NSString stringWithUTF8String:scale::kShortNames[pc]];
         NSSize sz = [name sizeWithAttributes:attrs];
         [name drawAtPoint:NSMakePoint(colX + (colW - sz.width) * 0.5, baseY + 2)
            withAttributes:attrs];
@@ -267,10 +263,117 @@ static NSString* const kPcShortNames[12] = {
 @end
 
 // ------------------------------------------------------------
+// Chord pad: momentary button for one diatonic triad
+// ------------------------------------------------------------
+
+@class ChordPadView;
+
+@protocol ChordPadDelegate
+- (void)chordPadPressed:(ChordPadView*)pad;
+- (void)chordPadReleased:(ChordPadView*)pad;
+@end
+
+@interface ChordPadView : NSView
+@property(nonatomic, assign) int degree;
+@property(nonatomic, copy)   NSString* numeral;
+@property(nonatomic, copy)   NSString* chordName;
+@property(nonatomic, assign) BOOL enabled;
+@property(nonatomic, assign) BOOL pressed;
+@property(nonatomic, weak)   id<ChordPadDelegate> delegate;
+@end
+
+@implementation ChordPadView
+
+- (BOOL)isFlipped { return YES; }
+
+// Respond to the first click even when the plugin window isn't key.
+- (BOOL)acceptsFirstMouse:(NSEvent*)event { (void)event; return YES; }
+
+- (void)setNumeral:(NSString*)numeral chordName:(NSString*)chordName enabled:(BOOL)enabled {
+    if ([numeral isEqualToString:_numeral] && [chordName isEqualToString:_chordName]
+        && enabled == _enabled) {
+        return;
+    }
+    _numeral = [numeral copy];
+    _chordName = [chordName copy];
+    _enabled = enabled;
+    [self setNeedsDisplay:YES];
+}
+
+- (void)mouseDown:(NSEvent*)event {
+    (void)event;
+    if (!self.enabled) return;
+    self.pressed = YES;
+    [self setNeedsDisplay:YES];
+    [self.delegate chordPadPressed:self];
+}
+
+- (void)mouseUp:(NSEvent*)event {
+    (void)event;
+    if (!self.pressed) return;
+    self.pressed = NO;
+    [self setNeedsDisplay:YES];
+    [self.delegate chordPadReleased:self];
+}
+
+- (void)drawRect:(NSRect)dirtyRect {
+    (void)dirtyRect;
+    NSRect b = NSInsetRect(self.bounds, 0.5, 0.5);
+
+    NSColor* fill;
+    NSColor* border;
+    NSColor* numeralColor;
+    NSColor* nameColor;
+    if (!self.enabled) {
+        fill         = [NSColor colorWithCalibratedRed:0.12 green:0.12 blue:0.14 alpha:1.0];
+        border       = [NSColor colorWithCalibratedWhite:0.20 alpha:1.0];
+        numeralColor = [NSColor colorWithCalibratedWhite:0.32 alpha:1.0];
+        nameColor    = numeralColor;
+    } else if (self.pressed) {
+        fill         = [NSColor colorWithCalibratedRed:0.32 green:0.74 blue:1.00 alpha:1.0];
+        border       = [NSColor colorWithCalibratedRed:0.60 green:0.85 blue:1.00 alpha:1.0];
+        numeralColor = [NSColor colorWithCalibratedRed:0.05 green:0.10 blue:0.16 alpha:1.0];
+        nameColor    = numeralColor;
+    } else {
+        fill         = [NSColor colorWithCalibratedRed:0.16 green:0.16 blue:0.20 alpha:1.0];
+        border       = [NSColor colorWithCalibratedWhite:0.30 alpha:1.0];
+        numeralColor = [NSColor whiteColor];
+        nameColor    = [NSColor colorWithCalibratedWhite:0.62 alpha:1.0];
+    }
+
+    NSBezierPath* shape = [NSBezierPath bezierPathWithRoundedRect:b xRadius:5 yRadius:5];
+    [fill setFill];
+    [shape fill];
+    [border setStroke];
+    [shape setLineWidth:1.0];
+    [shape stroke];
+
+    NSDictionary* numeralAttrs = @{
+        NSFontAttributeName: [NSFont systemFontOfSize:15 weight:NSFontWeightSemibold],
+        NSForegroundColorAttributeName: numeralColor,
+    };
+    NSDictionary* nameAttrs = @{
+        NSFontAttributeName: [NSFont systemFontOfSize:10 weight:NSFontWeightMedium],
+        NSForegroundColorAttributeName: nameColor,
+    };
+    NSString* numeral = self.numeral ?: @"";
+    NSString* name = self.chordName ?: @"";
+    NSSize ns = [numeral sizeWithAttributes:numeralAttrs];
+    NSSize cs = [name sizeWithAttributes:nameAttrs];
+    CGFloat top = (self.bounds.size.height - ns.height - cs.height) * 0.5;
+    [numeral drawAtPoint:NSMakePoint((self.bounds.size.width - ns.width) * 0.5, top)
+          withAttributes:numeralAttrs];
+    [name drawAtPoint:NSMakePoint((self.bounds.size.width - cs.width) * 0.5, top + ns.height)
+       withAttributes:nameAttrs];
+}
+
+@end
+
+// ------------------------------------------------------------
 // Container view: label stack + keyboard + polling timer
 // ------------------------------------------------------------
 
-@interface ChordAnalyzerView : NSView
+@interface ChordAnalyzerView : NSView <ChordPadDelegate>
 @property(nonatomic, strong) NSTextField* subtitleLabel;
 @property(nonatomic, strong) NSTextField* chordLabel;
 @property(nonatomic, strong) KeyboardView* keyboardView;
@@ -282,6 +385,7 @@ static NSString* const kPcShortNames[12] = {
 @property(nonatomic, strong) NSButton* useDetectedButton;
 @property(nonatomic, strong) NSButton* resetHistoryButton;
 @property(nonatomic, strong) HistogramView* histogramView;
+@property(nonatomic, strong) NSArray<ChordPadView*>* chordPads;
 @property(nonatomic, assign) int detectedRoot;
 @property(nonatomic, assign) int detectedType;
 @property(nonatomic, strong) NSTimer* pollTimer;
@@ -369,6 +473,16 @@ static NSString* const kPcShortNames[12] = {
         _scaleTypePopup.action = @selector(scaleSelectionChanged:);
         [self addSubview:_scaleTypePopup];
 
+        NSMutableArray<ChordPadView*>* pads = [NSMutableArray array];
+        for (int d = 0; d < 7; ++d) {
+            ChordPadView* pad = [[ChordPadView alloc] initWithFrame:NSZeroRect];
+            pad.degree = d;
+            pad.delegate = self;
+            [self addSubview:pad];
+            [pads addObject:pad];
+        }
+        _chordPads = pads;
+
         [self applyScaleRoot:0 type:0];
 
         NSColor* dim = [NSColor colorWithCalibratedWhite:0.55 alpha:1.0];
@@ -417,6 +531,7 @@ static NSString* const kPcShortNames[12] = {
     CGFloat rowGap = 8;
     CGFloat histH = 80;
     CGFloat sectionGap = 14;
+    CGFloat padH = 44;
 
     self.subtitleLabel.frame = NSMakeRect(0, pad, b.size.width, 16);
 
@@ -424,7 +539,8 @@ static NSString* const kPcShortNames[12] = {
     CGFloat histY = b.size.height - pad - histH;
     CGFloat detectY = histY - 6 - rowH;
     CGFloat kbY = detectY - sectionGap - kbH;
-    CGFloat rowY = kbY - rowGap - rowH;
+    CGFloat padY = kbY - rowGap - padH;
+    CGFloat rowY = padY - rowGap - rowH;
 
     CGFloat chordY = pad + 22;
     CGFloat chordH = rowY - pad - chordY;
@@ -444,6 +560,13 @@ static NSString* const kPcShortNames[12] = {
     self.rootPopup.frame      = NSMakeRect(pad + 40, rowY, 84, rowH);
     self.scaleTypePopup.frame = NSMakeRect(pad + 40 + 84 + 6, rowY, 140, rowH);
 
+    CGFloat padGap = 6;
+    CGFloat padW = (b.size.width - pad * 2 - padGap * 6) / 7.0;
+    for (ChordPadView* p in self.chordPads) {
+        CGFloat x = std::round(pad + p.degree * (padW + padGap));
+        p.frame = NSMakeRect(x, padY, std::round(padW), padH);
+    }
+
     self.keyboardView.frame = NSMakeRect(pad, kbY, b.size.width - pad * 2, kbH);
 }
 
@@ -452,6 +575,32 @@ static NSString* const kPcShortNames[12] = {
     if (self.scaleTypePopup.indexOfSelectedItem != type) [self.scaleTypePopup selectItemAtIndex:type];
     self.rootPopup.enabled = type != 0;
     [self.keyboardView updateScaleMask:scale::pitchClassMask(root, type) root:root];
+    [self updateChordPadsForRoot:root type:type];
+}
+
+- (void)updateChordPadsForRoot:(int)root type:(int)type {
+    static NSString* const kPlainNumerals[7] = {@"I", @"II", @"III", @"IV", @"V", @"VI", @"VII"};
+    for (ChordPadView* pad in self.chordPads) {
+        scale::Triad t;
+        if (scale::diatonicTriad(root, type, pad.degree, &t)) {
+            NSString* numeral = [NSString stringWithUTF8String:
+                                 scale::romanNumeral(pad.degree, t.quality).c_str()];
+            NSString* name = [NSString stringWithUTF8String:scale::triadName(t).c_str()];
+            [pad setNumeral:numeral chordName:name enabled:YES];
+        } else {
+            // Pentatonic/blues/none: no seven diatonic triads.
+            [pad setNumeral:kPlainNumerals[pad.degree] chordName:@"—" enabled:NO];
+        }
+    }
+}
+
+- (void)chordPadPressed:(ChordPadView*)pad {
+    if (self.callbacks.playChord) self.callbacks.playChord(self.callbacks.userData, pad.degree);
+}
+
+- (void)chordPadReleased:(ChordPadView*)pad {
+    (void)pad;
+    if (self.callbacks.releaseChord) self.callbacks.releaseChord(self.callbacks.userData);
 }
 
 - (void)scaleSelectionChanged:(id)sender {
@@ -635,7 +784,7 @@ bool chordGuiSetParent(void* view, void* parentNSView) {
 
 void chordGuiGetPreferredSize(uint32_t* w, uint32_t* h) {
     if (w) *w = 440;
-    if (h) *h = 420;
+    if (h) *h = 480;
 }
 
 } // extern "C"

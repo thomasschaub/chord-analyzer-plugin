@@ -17,8 +17,10 @@
 namespace {
 
 constexpr uint32_t kGuiWidth  = 440;
-constexpr uint32_t kGuiHeight = 420;
+constexpr uint32_t kGuiHeight = 480;
 constexpr int kHistorySize = 100;
+constexpr int kChordBaseKey = 48;      // scale root is voiced from C3..B3
+constexpr double kChordVelocity = 0.8;
 
 struct ChordAnalyzer {
     const clap_host_t* host = nullptr;
@@ -35,6 +37,18 @@ struct ChordAnalyzer {
 
     std::atomic<uint8_t> scaleRoot{0};
     std::atomic<uint8_t> scaleType{0};
+
+    // Chord pad output. The GUI sets the desired chord (empty = released)
+    // and bumps padGen on every press/release; guarded by outMutex.
+    std::mutex outMutex;
+    int      padKeys[3] = {};
+    int      padKeyCount = 0;
+    uint32_t padGen = 0;
+
+    // What the audio thread has actually sent. Audio thread only.
+    int      sentKeys[3] = {};
+    int      sentKeyCount = 0;
+    uint32_t sentGen = 0;
 
     void* guiView = nullptr;
     bool guiVisible = false;
@@ -76,6 +90,26 @@ void fillChordSnapshot(void* userData, ChordSnapshot* out) {
     out->scaleType = self->scaleType.load();
 }
 
+void onPlayChord(void* userData, int degree) {
+    auto* self = static_cast<ChordAnalyzer*>(userData);
+    int root = self->scaleRoot.load();
+    scale::Triad t;
+    if (!scale::diatonicTriad(root, self->scaleType.load(), degree, &t)) return;
+
+    std::lock_guard<std::mutex> lk(self->outMutex);
+    for (int k = 0; k < 3; ++k) self->padKeys[k] = kChordBaseKey + root + t.offsets[k];
+    self->padKeyCount = 3;
+    self->padGen++;
+}
+
+void onReleaseChord(void* userData) {
+    auto* self = static_cast<ChordAnalyzer*>(userData);
+    std::lock_guard<std::mutex> lk(self->outMutex);
+    if (self->padKeyCount == 0) return;
+    self->padKeyCount = 0;
+    self->padGen++;
+}
+
 void onResetHistory(void* userData) {
     auto* self = static_cast<ChordAnalyzer*>(userData);
     std::lock_guard<std::mutex> lk(self->notesMutex);
@@ -99,6 +133,53 @@ void onScaleChanged(void* userData, uint8_t root, uint8_t type) {
 #endif
 
 // -------- helpers --------
+
+void pushNote(const clap_output_events_t* out, int key, bool on) {
+    clap_event_note_t ev{};
+    ev.header.size     = sizeof(ev);
+    ev.header.time     = 0;
+    ev.header.space_id = CLAP_CORE_EVENT_SPACE_ID;
+    ev.header.type     = on ? CLAP_EVENT_NOTE_ON : CLAP_EVENT_NOTE_OFF;
+    ev.header.flags    = 0;
+    ev.note_id    = -1;
+    ev.port_index = 0;
+    ev.channel    = 0;
+    ev.key        = static_cast<int16_t>(key);
+    ev.velocity   = on ? kChordVelocity : 0.0;
+    out->try_push(out, &ev.header);
+}
+
+// Brings the sent pad chord in line with what the GUI wants. Emitted at
+// time 0, before pass-through events, so the output stays time-sorted.
+// try_lock: never block the audio thread; a missed update goes out next block.
+void emitPadChord(ChordAnalyzer* self, const clap_output_events_t* out) {
+    if (!self->outMutex.try_lock()) return;
+    if (self->padGen != self->sentGen) {
+        for (int i = 0; i < self->sentKeyCount; ++i) pushNote(out, self->sentKeys[i], false);
+        for (int i = 0; i < self->padKeyCount; ++i) pushNote(out, self->padKeys[i], true);
+        std::memcpy(self->sentKeys, self->padKeys, sizeof(self->sentKeys));
+        self->sentKeyCount = self->padKeyCount;
+        self->sentGen = self->padGen;
+    }
+    self->outMutex.unlock();
+}
+
+// Events passed through unchanged from the note input to the note output.
+bool isNoteEvent(const clap_event_header_t* hdr) {
+    if (hdr->space_id != CLAP_CORE_EVENT_SPACE_ID) return false;
+    switch (hdr->type) {
+        case CLAP_EVENT_NOTE_ON:
+        case CLAP_EVENT_NOTE_OFF:
+        case CLAP_EVENT_NOTE_CHOKE:
+        case CLAP_EVENT_NOTE_EXPRESSION:
+        case CLAP_EVENT_MIDI:
+        case CLAP_EVENT_MIDI_SYSEX:
+        case CLAP_EVENT_MIDI2:
+            return true;
+        default:
+            return false;
+    }
+}
 
 // Call with notesMutex held.
 void recordNoteOn(ChordAnalyzer* self, int key) {
@@ -172,10 +253,16 @@ void plugin_reset(const clap_plugin_t* p) {
 clap_process_status plugin_process(const clap_plugin_t* p, const clap_process_t* proc) {
     auto* self = static_cast<ChordAnalyzer*>(p->plugin_data);
 
+    if (proc->out_events) emitPadChord(self, proc->out_events);
+
     if (proc->in_events) {
         const uint32_t nev = proc->in_events->size(proc->in_events);
         for (uint32_t i = 0; i < nev; ++i) {
-            handleEvent(self, proc->in_events->get(proc->in_events, i));
+            const clap_event_header_t* hdr = proc->in_events->get(proc->in_events, i);
+            handleEvent(self, hdr);
+            if (proc->out_events && isNoteEvent(hdr)) {
+                proc->out_events->try_push(proc->out_events, hdr);
+            }
         }
     }
 
@@ -205,17 +292,15 @@ void plugin_on_main_thread(const clap_plugin_t*) {}
 
 // -------- extensions: note ports --------
 
-uint32_t note_ports_count(const clap_plugin_t*, bool is_input) {
-    return is_input ? 1 : 0;
-}
+uint32_t note_ports_count(const clap_plugin_t*, bool) { return 1; }
 
 bool note_ports_get(const clap_plugin_t*, uint32_t index, bool is_input,
                     clap_note_port_info_t* info) {
-    if (!is_input || index != 0) return false;
-    info->id = 0;
+    if (index != 0) return false;
+    info->id = is_input ? 0u : 1u;
     info->supported_dialects = CLAP_NOTE_DIALECT_CLAP | CLAP_NOTE_DIALECT_MIDI;
     info->preferred_dialect  = CLAP_NOTE_DIALECT_CLAP;
-    std::snprintf(info->name, sizeof(info->name), "Note In");
+    std::snprintf(info->name, sizeof(info->name), is_input ? "Note In" : "Note Out");
     return true;
 }
 
@@ -313,6 +398,8 @@ bool gui_create(const clap_plugin_t* p, const char* api, bool is_floating) {
         cb.getSnapshot  = &fillChordSnapshot;
         cb.setScale     = &onScaleChanged;
         cb.resetHistory = &onResetHistory;
+        cb.playChord    = &onPlayChord;
+        cb.releaseChord = &onReleaseChord;
         self->guiView = chordGuiCreate(kGuiWidth, kGuiHeight, cb);
         if (!self->guiView) return false;
     }
@@ -330,6 +417,8 @@ void gui_destroy(const clap_plugin_t* p) {
         chordGuiDestroy(self->guiView);
         self->guiView = nullptr;
     }
+    // Don't leave a pad chord hanging if the editor closes mid-press.
+    onReleaseChord(self);
 #endif
     self->guiVisible = false;
 }

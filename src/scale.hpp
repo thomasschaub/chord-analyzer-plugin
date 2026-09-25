@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <initializer_list>
+#include <string>
 #include <utility>
 
 namespace scale {
@@ -40,6 +41,11 @@ inline constexpr int kTypeCount = static_cast<int>(sizeof(kTypes) / sizeof(kType
 
 inline constexpr const char* kRootNames[12] = {
     "C", "C♯/D♭", "D", "E♭", "E", "F", "F♯/G♭", "G", "A♭", "A", "B♭", "B",
+};
+
+// Compact names for tight spaces (histogram labels, chord names).
+inline constexpr const char* kShortNames[12] = {
+    "C", "C♯", "D", "E♭", "E", "F", "F♯", "G", "A♭", "A", "B♭", "B",
 };
 
 // Mask over absolute pitch classes (bit 0 = C) for the given root and type.
@@ -158,6 +164,71 @@ inline Detection detect(const uint16_t counts[12]) {
         }
     }
     return best;
+}
+
+// ------------------------------------------------------------
+// Diatonic triads
+// ------------------------------------------------------------
+
+enum class TriadQuality { Major, Minor, Diminished, Augmented, Other };
+
+struct Triad {
+    int offsets[3];       // semitones above the scale root, ascending
+    int rootPc;           // absolute pitch class of the chord root
+    TriadQuality quality;
+};
+
+// Builds the triad on scale degree 0-6 (I-VII) by stacking every other
+// scale note. Only defined for seven-note scales; returns false otherwise.
+inline bool diatonicTriad(int root, int type, int degree, Triad* out) {
+    if (type <= 0 || type >= kTypeCount || root < 0 || root > 11) return false;
+    if (degree < 0 || degree > 6) return false;
+
+    int steps[12];
+    int n = 0;
+    for (int i = 0; i < 12; ++i) {
+        if ((kTypes[type].mask >> i) & 1) steps[n++] = i;
+    }
+    if (n != 7) return false;
+
+    for (int k = 0; k < 3; ++k) {
+        int idx = degree + 2 * k;
+        out->offsets[k] = steps[idx % 7] + 12 * (idx / 7);
+    }
+    out->rootPc = (root + out->offsets[0]) % 12;
+
+    int third = out->offsets[1] - out->offsets[0];
+    int fifth = out->offsets[2] - out->offsets[0];
+    if      (third == 4 && fifth == 7) out->quality = TriadQuality::Major;
+    else if (third == 3 && fifth == 7) out->quality = TriadQuality::Minor;
+    else if (third == 3 && fifth == 6) out->quality = TriadQuality::Diminished;
+    else if (third == 4 && fifth == 8) out->quality = TriadQuality::Augmented;
+    else                               out->quality = TriadQuality::Other;
+    return true;
+}
+
+// Roman numeral: upper case for major/augmented, lower case for
+// minor/diminished, e.g. "V", "ii", "vii°", "III+".
+inline std::string romanNumeral(int degree, TriadQuality q) {
+    static const char* const upper[7] = {"I", "II", "III", "IV", "V", "VI", "VII"};
+    static const char* const lower[7] = {"i", "ii", "iii", "iv", "v", "vi", "vii"};
+    bool minorish = q == TriadQuality::Minor || q == TriadQuality::Diminished;
+    std::string s = minorish ? lower[degree] : upper[degree];
+    if (q == TriadQuality::Diminished) s += "°";
+    if (q == TriadQuality::Augmented)  s += "+";
+    return s;
+}
+
+// Chord symbol such as "Gm", "F♯°" or "E♭+".
+inline std::string triadName(const Triad& t) {
+    std::string s = kShortNames[t.rootPc];
+    switch (t.quality) {
+        case TriadQuality::Minor:      s += "m"; break;
+        case TriadQuality::Diminished: s += "°"; break;
+        case TriadQuality::Augmented:  s += "+"; break;
+        default: break;
+    }
+    return s;
 }
 
 } // namespace scale

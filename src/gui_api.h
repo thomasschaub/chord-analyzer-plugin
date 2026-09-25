@@ -26,6 +26,10 @@ struct ChordGuiCallbacks {
     void (*getSnapshot)(void* userData, ChordSnapshot* out);
     void (*setScale)(void* userData, uint8_t root, uint8_t type);
     void (*resetHistory)(void* userData);
+    // Start sending the diatonic triad on scale degree 0-6 (I-VII) of the
+    // current scale; releaseChord sends the matching note-offs.
+    void (*playChord)(void* userData, int degree);
+    void (*releaseChord)(void* userData);
 };
 
 void* chordGuiCreate(uint32_t w, uint32_t h, ChordGuiCallbacks callbacks);
