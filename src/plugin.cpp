@@ -1,12 +1,17 @@
 #include <clap/clap.h>
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <mutex>
 #include <set>
 #include <string>
+#include <thread>
+#include <vector>
 
+#include "audio_analyzer.hpp"
 #include "chord_detector.hpp"
 #include "scale.hpp"
 
@@ -19,12 +24,18 @@ namespace {
 constexpr uint32_t kGuiWidth  = 440;
 constexpr uint32_t kGuiHeight = 520;
 constexpr int kHistorySize = 100;
+// How often the analysis thread looks at the audio input.
+constexpr auto kAnalysisHop = std::chrono::milliseconds(25);
+// Hops without new audio (host stopped calling process) before the audio
+// notes are released instead of re-analysing the last window forever.
+constexpr int kAnalysisIdleHops = 8;
 
 struct ChordAnalyzer {
     const clap_host_t* host = nullptr;
 
     std::mutex notesMutex;
-    std::set<int> notes;
+    std::set<int> notes;       // held MIDI notes
+    std::set<int> audioNotes;  // notes estimated from the audio input
 
     // Ring buffer of the pitch classes of the last kHistorySize note-ons,
     // plus a running per-pitch-class count. Guarded by notesMutex.
@@ -48,6 +59,17 @@ struct ChordAnalyzer {
     int      sentKeyCount = 0;
     uint32_t sentGen = 0;
 
+    // Audio analysis. process() copies the input into `ring`; the analysis
+    // thread estimates the sounding notes and publishes them to audioNotes.
+    // Runs between activate and deactivate; the audio itself passes through
+    // undelayed.
+    audio::SampleRing ring;
+    double sampleRate = 44100.0;
+    std::thread analysisThread;
+    std::mutex analysisMutex;
+    std::condition_variable analysisWake;
+    bool analysisStop = false; // guarded by analysisMutex
+
     void* guiView = nullptr;
     bool guiVisible = false;
 
@@ -63,9 +85,11 @@ void fillChordSnapshot(void* userData, ChordSnapshot* out) {
     chord::Result r;
     {
         std::lock_guard<std::mutex> lk(self->notesMutex);
-        r = chord::detect(self->notes);
+        std::set<int> held = self->notes;
+        held.insert(self->audioNotes.begin(), self->audioNotes.end());
+        r = chord::detect(held);
         uint8_t count = 0;
-        for (int n : self->notes) {
+        for (int n : held) {
             if (count >= sizeof(out->notes)) break;
             if (n < 0 || n > 127) continue;
             out->notes[count++] = static_cast<uint8_t>(n);
@@ -196,6 +220,62 @@ void recordNoteOn(ChordAnalyzer* self, int key) {
     self->pcCounts[pc]++;
 }
 
+void runAnalysis(ChordAnalyzer* self) {
+    audio::NoteEstimator estimator;
+    estimator.prepare(self->sampleRate);
+    audio::NoteTracker tracker;
+    std::vector<float> window(estimator.windowSize());
+    std::vector<int> frameKeys;
+    std::vector<int> onsets;
+    uint64_t lastPos = 0;
+    int idleHops = 0;
+
+    std::unique_lock<std::mutex> lk(self->analysisMutex);
+    while (!self->analysisStop) {
+        lk.unlock();
+
+        const uint64_t pos = self->ring.writePos();
+        idleHops = pos == lastPos ? idleHops + 1 : 0;
+        lastPos = pos;
+
+        frameKeys.clear();
+        if (idleHops < kAnalysisIdleHops && self->ring.readLatest(window.data(), window.size())) {
+            estimator.estimate(window.data(), frameKeys);
+        }
+        if (tracker.update(frameKeys, onsets)) {
+            std::lock_guard<std::mutex> nl(self->notesMutex);
+            self->audioNotes.clear();
+            tracker.forEachHeld([&](int key) { self->audioNotes.insert(key); });
+            for (int key : onsets) recordNoteOn(self, key);
+        }
+
+        lk.lock();
+        self->analysisWake.wait_for(lk, kAnalysisHop, [self] { return self->analysisStop; });
+    }
+}
+
+void startAnalysis(ChordAnalyzer* self, double sampleRate) {
+    self->sampleRate = sampleRate;
+    // Room for the window plus several blocks, so the writer never laps a
+    // copy in progress.
+    self->ring.reset(audio::NoteEstimator::windowSizeFor(sampleRate) * 4);
+    self->analysisStop = false;
+    self->analysisThread = std::thread(runAnalysis, self);
+}
+
+void stopAnalysis(ChordAnalyzer* self) {
+    if (!self->analysisThread.joinable()) return;
+    {
+        std::lock_guard<std::mutex> lk(self->analysisMutex);
+        self->analysisStop = true;
+    }
+    self->analysisWake.notify_all();
+    self->analysisThread.join();
+
+    std::lock_guard<std::mutex> lk(self->notesMutex);
+    self->audioNotes.clear();
+}
+
 void handleEvent(ChordAnalyzer* self, const clap_event_header_t* hdr) {
     if (hdr->space_id != CLAP_CORE_EVENT_SPACE_ID) return;
     switch (hdr->type) {
@@ -238,11 +318,20 @@ bool plugin_init(const clap_plugin_t*) { return true; }
 
 void plugin_destroy(const clap_plugin_t* p) {
     auto* self = static_cast<ChordAnalyzer*>(p->plugin_data);
+    stopAnalysis(self);
     delete self;
 }
 
-bool plugin_activate(const clap_plugin_t*, double, uint32_t, uint32_t) { return true; }
-void plugin_deactivate(const clap_plugin_t*) {}
+bool plugin_activate(const clap_plugin_t* p, double sampleRate, uint32_t, uint32_t) {
+    auto* self = static_cast<ChordAnalyzer*>(p->plugin_data);
+    stopAnalysis(self);
+    startAnalysis(self, sampleRate);
+    return true;
+}
+
+void plugin_deactivate(const clap_plugin_t* p) {
+    stopAnalysis(static_cast<ChordAnalyzer*>(p->plugin_data));
+}
 bool plugin_start_processing(const clap_plugin_t*) { return true; }
 void plugin_stop_processing(const clap_plugin_t*) {}
 
@@ -268,12 +357,15 @@ clap_process_status plugin_process(const clap_plugin_t* p, const clap_process_t*
         }
     }
 
+    const uint32_t frames = proc->frames_count;
+    const bool hasIn      = proc->audio_inputs_count > 0
+                          && proc->audio_inputs[0].data32 != nullptr;
+    const uint32_t inCh   = hasIn ? proc->audio_inputs[0].channel_count : 0;
+
+    if (hasIn) self->ring.write(proc->audio_inputs[0].data32, inCh, frames);
+
     if (proc->audio_outputs_count > 0 && proc->audio_outputs[0].data32) {
-        const uint32_t frames = proc->frames_count;
         const uint32_t outCh  = proc->audio_outputs[0].channel_count;
-        const bool hasIn      = proc->audio_inputs_count > 0
-                              && proc->audio_inputs[0].data32 != nullptr;
-        const uint32_t inCh   = hasIn ? proc->audio_inputs[0].channel_count : 0;
 
         for (uint32_t c = 0; c < outCh; ++c) {
             float* dst = proc->audio_outputs[0].data32[c];
@@ -517,7 +609,7 @@ const clap_plugin_descriptor_t kDescriptor = {
     "",
     "",
     "0.1.0",
-    "Displays the chord name of incoming MIDI notes.",
+    "Displays the chord name of incoming MIDI notes or audio.",
     kFeatures,
 };
 

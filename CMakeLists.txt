@@ -28,7 +28,8 @@ if(APPLE)
 endif()
 
 add_library(chord-analyzer MODULE ${PLUGIN_SOURCES})
-target_link_libraries(chord-analyzer PRIVATE clap)
+find_package(Threads REQUIRED)
+target_link_libraries(chord-analyzer PRIVATE clap Threads::Threads)
 target_include_directories(chord-analyzer PRIVATE src)
 
 if(APPLE)
