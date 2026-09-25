@@ -17,7 +17,7 @@
 namespace {
 
 constexpr uint32_t kGuiWidth  = 440;
-constexpr uint32_t kGuiHeight = 480;
+constexpr uint32_t kGuiHeight = 520;
 constexpr int kHistorySize = 100;
 
 struct ChordAnalyzer {
@@ -39,12 +39,12 @@ struct ChordAnalyzer {
     // Chord pad output. The GUI sets the desired chord (empty = released)
     // and bumps padGen on every press/release; guarded by outMutex.
     std::mutex outMutex;
-    int      padKeys[3] = {};
+    int      padKeys[scale::kMaxChordNotes] = {};
     int      padKeyCount = 0;
     uint32_t padGen = 0;
 
     // What the audio thread has actually sent. Audio thread only.
-    int      sentKeys[3] = {};
+    int      sentKeys[scale::kMaxChordNotes] = {};
     int      sentKeyCount = 0;
     uint32_t sentGen = 0;
 
@@ -88,15 +88,19 @@ void fillChordSnapshot(void* userData, ChordSnapshot* out) {
     out->scaleType = self->scaleType.load();
 }
 
-void onPlayChord(void* userData, int degree) {
+void onPlayChord(void* userData, int degree, int variant) {
     auto* self = static_cast<ChordAnalyzer*>(userData);
+    if (variant < 0 || variant >= scale::kVariantCount) return;
     int root = self->scaleRoot.load();
-    scale::Triad t;
-    if (!scale::diatonicTriad(root, self->scaleType.load(), degree, &t)) return;
+    scale::Chord c;
+    if (!scale::diatonicChord(root, self->scaleType.load(), degree,
+                              static_cast<scale::ChordVariant>(variant), &c)) {
+        return;
+    }
 
     std::lock_guard<std::mutex> lk(self->outMutex);
-    scale::triadKeys(root, t, self->padKeys);
-    self->padKeyCount = 3;
+    scale::chordKeys(root, c, self->padKeys);
+    self->padKeyCount = c.count;
     self->padGen++;
 }
 

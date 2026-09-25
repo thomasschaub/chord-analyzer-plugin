@@ -278,6 +278,7 @@ static inline bool isWhitePc(int pc) {
 
 @interface ChordPadView : NSView <NSDraggingSource>
 @property(nonatomic, assign) int degree;
+@property(nonatomic, assign) int variant; // scale::ChordVariant; non-triad pads are compact
 @property(nonatomic, copy)   NSString* numeral;
 @property(nonatomic, copy)   NSString* chordName;
 @property(nonatomic, assign) BOOL enabled;
@@ -384,12 +385,28 @@ static inline bool isWhitePc(int pc) {
         nameColor    = [NSColor colorWithCalibratedWhite:0.62 alpha:1.0];
     }
 
-    NSBezierPath* shape = [NSBezierPath bezierPathWithRoundedRect:b xRadius:5 yRadius:5];
+    BOOL compact = self.variant != (int)scale::ChordVariant::Triad;
+    CGFloat radius = compact ? 3 : 5;
+    NSBezierPath* shape = [NSBezierPath bezierPathWithRoundedRect:b xRadius:radius yRadius:radius];
     [fill setFill];
     [shape fill];
     [border setStroke];
     [shape setLineWidth:1.0];
     [shape stroke];
+
+    if (compact) {
+        // Variant buttons show only their label ("sus2", "7", ...).
+        NSDictionary* attrs = @{
+            NSFontAttributeName: [NSFont systemFontOfSize:9 weight:NSFontWeightMedium],
+            NSForegroundColorAttributeName: self.enabled && !self.pressed ? nameColor : numeralColor,
+        };
+        NSString* label = self.numeral ?: @"";
+        NSSize ls = [label sizeWithAttributes:attrs];
+        [label drawAtPoint:NSMakePoint((self.bounds.size.width - ls.width) * 0.5,
+                                       (self.bounds.size.height - ls.height) * 0.5)
+            withAttributes:attrs];
+        return;
+    }
 
     NSDictionary* numeralAttrs = @{
         NSFontAttributeName: [NSFont systemFontOfSize:15 weight:NSFontWeightSemibold],
@@ -429,6 +446,8 @@ static inline bool isWhitePc(int pc) {
 @property(nonatomic, strong) NSButton* resetHistoryButton;
 @property(nonatomic, strong) HistogramView* histogramView;
 @property(nonatomic, strong) NSArray<ChordPadView*>* chordPads;
+@property(nonatomic, assign) int padsRoot;  // scale the pads are labelled for
+@property(nonatomic, assign) int padsType;
 @property(nonatomic, assign) int detectedRoot;
 @property(nonatomic, assign) int detectedType;
 @property(nonatomic, strong) NSTimer* pollTimer;
@@ -537,14 +556,18 @@ static inline bool isWhitePc(int pc) {
 
         NSMutableArray<ChordPadView*>* pads = [NSMutableArray array];
         for (int d = 0; d < 7; ++d) {
-            ChordPadView* pad = [[ChordPadView alloc] initWithFrame:NSZeroRect];
-            pad.degree = d;
-            pad.delegate = self;
-            pad.toolTip = @"Click to play, drag into your DAW as a MIDI clip";
-            [self addSubview:pad];
-            [pads addObject:pad];
+            for (int v = 0; v < scale::kVariantCount; ++v) {
+                ChordPadView* pad = [[ChordPadView alloc] initWithFrame:NSZeroRect];
+                pad.degree = d;
+                pad.variant = v;
+                pad.delegate = self;
+                [self addSubview:pad];
+                [pads addObject:pad];
+            }
         }
         _chordPads = pads;
+        _padsRoot = -1;
+        _padsType = -1;
 
         [self applyScaleRoot:0 type:0];
 
@@ -595,6 +618,9 @@ static inline bool isWhitePc(int pc) {
     CGFloat histH = 80;
     CGFloat sectionGap = 14;
     CGFloat padH = 44;
+    CGFloat variantH = 16;
+    CGFloat variantGap = 2;
+    CGFloat variantBlockH = 4 + variantH * 2 + variantGap;
 
     self.subtitleLabel.frame = NSMakeRect(0, pad, b.size.width, 16);
 
@@ -602,7 +628,7 @@ static inline bool isWhitePc(int pc) {
     CGFloat histY = b.size.height - pad - histH;
     CGFloat detectY = histY - 6 - rowH;
     CGFloat kbY = detectY - sectionGap - kbH;
-    CGFloat padY = kbY - rowGap - padH;
+    CGFloat padY = kbY - rowGap - variantBlockH - padH;
     CGFloat rowY = padY - rowGap - rowH;
 
     CGFloat chordY = pad + 22;
@@ -625,9 +651,18 @@ static inline bool isWhitePc(int pc) {
 
     CGFloat padGap = 6;
     CGFloat padW = (b.size.width - pad * 2 - padGap * 6) / 7.0;
+    // Variant buttons sit in a 2x2 grid under their pad: sus2 sus4 / 7 9.
+    CGFloat variantW = std::floor((std::round(padW) - variantGap) * 0.5);
     for (ChordPadView* p in self.chordPads) {
         CGFloat x = std::round(pad + p.degree * (padW + padGap));
-        p.frame = NSMakeRect(x, padY, std::round(padW), padH);
+        if (p.variant == (int)scale::ChordVariant::Triad) {
+            p.frame = NSMakeRect(x, padY, std::round(padW), padH);
+            continue;
+        }
+        int cell = p.variant - 1;
+        CGFloat cx = x + (cell % 2) * (variantW + variantGap);
+        CGFloat cy = padY + padH + 4 + (cell / 2) * (variantH + variantGap);
+        p.frame = NSMakeRect(cx, cy, variantW, variantH);
     }
 
     self.keyboardView.frame = NSMakeRect(pad, kbY, b.size.width - pad * 2, kbH);
@@ -643,22 +678,42 @@ static inline bool isWhitePc(int pc) {
 
 - (void)updateChordPadsForRoot:(int)root type:(int)type {
     static NSString* const kPlainNumerals[7] = {@"I", @"II", @"III", @"IV", @"V", @"VI", @"VII"};
+    static NSString* const kVariantLabels[scale::kVariantCount] = {@"", @"sus2", @"sus4", @"7", @"9"};
+    // Called on every poll; relabelling (and resetting tooltips) only on change.
+    if (root == self.padsRoot && type == self.padsType) return;
+    self.padsRoot = root;
+    self.padsType = type;
     for (ChordPadView* pad in self.chordPads) {
-        scale::Triad t;
-        if (scale::diatonicTriad(root, type, pad.degree, &t)) {
-            NSString* numeral = [NSString stringWithUTF8String:
-                                 scale::romanNumeral(pad.degree, t.quality).c_str()];
-            NSString* name = [NSString stringWithUTF8String:scale::triadName(t).c_str()];
-            [pad setNumeral:numeral chordName:name enabled:YES];
+        scale::Chord c;
+        BOOL ok = scale::diatonicChord(root, type, pad.degree,
+                                       (scale::ChordVariant)pad.variant, &c);
+        NSString* name = ok ? [NSString stringWithUTF8String:c.name.c_str()] : nil;
+
+        if (pad.variant == (int)scale::ChordVariant::Triad) {
+            scale::Triad t;
+            if (ok && scale::diatonicTriad(root, type, pad.degree, &t)) {
+                NSString* numeral = [NSString stringWithUTF8String:
+                                     scale::romanNumeral(pad.degree, t.quality).c_str()];
+                [pad setNumeral:numeral chordName:name enabled:YES];
+            } else {
+                // Pentatonic/blues/none: no seven diatonic triads.
+                [pad setNumeral:kPlainNumerals[pad.degree] chordName:@"—" enabled:NO];
+            }
         } else {
-            // Pentatonic/blues/none: no seven diatonic triads.
-            [pad setNumeral:kPlainNumerals[pad.degree] chordName:@"—" enabled:NO];
+            // Disabled when the scale can't form it (e.g. E sus2 in C major).
+            [pad setNumeral:kVariantLabels[pad.variant] chordName:@"" enabled:ok];
         }
+
+        pad.toolTip = ok
+            ? [NSString stringWithFormat:@"%@ — click to play, drag into your DAW", name]
+            : nil;
     }
 }
 
 - (void)chordPadPressed:(ChordPadView*)pad {
-    if (self.callbacks.playChord) self.callbacks.playChord(self.callbacks.userData, pad.degree);
+    if (self.callbacks.playChord) {
+        self.callbacks.playChord(self.callbacks.userData, pad.degree, pad.variant);
+    }
 }
 
 - (void)chordPadReleased:(ChordPadView*)pad {
@@ -669,14 +724,16 @@ static inline bool isWhitePc(int pc) {
 - (NSURL*)midiFileURLForChordPad:(ChordPadView*)pad {
     int root = (int)self.rootPopup.indexOfSelectedItem;
     int type = (int)self.scaleTypePopup.indexOfSelectedItem;
-    scale::Triad t;
-    if (!scale::diatonicTriad(root, type, pad.degree, &t)) return nil;
+    scale::Chord c;
+    if (!scale::diatonicChord(root, type, pad.degree, (scale::ChordVariant)pad.variant, &c)) {
+        return nil;
+    }
 
-    int keys[3];
-    scale::triadKeys(root, t, keys);
-    std::string name = scale::triadAsciiName(t);
+    int keys[scale::kMaxChordNotes];
+    scale::chordKeys(root, c, keys);
+    const std::string& name = c.asciiName;
     std::vector<uint8_t> bytes =
-        midifile::chordFile(keys, 3, (uint8_t)scale::kChordVelocity, name);
+        midifile::chordFile(keys, c.count, (uint8_t)scale::kChordVelocity, name);
 
     // A fresh directory per drag keeps the file name clean ("Cm.mid", which
     // hosts use as the clip name) without clobbering a file a host may
@@ -879,7 +936,7 @@ bool chordGuiSetParent(void* view, void* parentNSView) {
 
 void chordGuiGetPreferredSize(uint32_t* w, uint32_t* h) {
     if (w) *w = 440;
-    if (h) *h = 480;
+    if (h) *h = 520;
 }
 
 } // extern "C"

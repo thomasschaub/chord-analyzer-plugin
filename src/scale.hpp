@@ -178,23 +178,33 @@ struct Triad {
     TriadQuality quality;
 };
 
+// Semitones above the root for each note of a seven-note scale.
+// Returns false for scales with a different note count.
+inline bool sevenNoteSteps(int type, int steps[7]) {
+    if (type <= 0 || type >= kTypeCount) return false;
+    int n = 0;
+    for (int i = 0; i < 12; ++i) {
+        if ((kTypes[type].mask >> i) & 1) {
+            if (n == 7) return false;
+            steps[n++] = i;
+        }
+    }
+    return n == 7;
+}
+
+// Offset of scale note `idx` (may run past the octave) above the root.
+inline int stepOffset(const int steps[7], int idx) {
+    return steps[idx % 7] + 12 * (idx / 7);
+}
+
 // Builds the triad on scale degree 0-6 (I-VII) by stacking every other
 // scale note. Only defined for seven-note scales; returns false otherwise.
 inline bool diatonicTriad(int root, int type, int degree, Triad* out) {
-    if (type <= 0 || type >= kTypeCount || root < 0 || root > 11) return false;
-    if (degree < 0 || degree > 6) return false;
+    if (root < 0 || root > 11 || degree < 0 || degree > 6) return false;
+    int steps[7];
+    if (!sevenNoteSteps(type, steps)) return false;
 
-    int steps[12];
-    int n = 0;
-    for (int i = 0; i < 12; ++i) {
-        if ((kTypes[type].mask >> i) & 1) steps[n++] = i;
-    }
-    if (n != 7) return false;
-
-    for (int k = 0; k < 3; ++k) {
-        int idx = degree + 2 * k;
-        out->offsets[k] = steps[idx % 7] + 12 * (idx / 7);
-    }
+    for (int k = 0; k < 3; ++k) out->offsets[k] = stepOffset(steps, degree + 2 * k);
     out->rootPc = (root + out->offsets[0]) % 12;
 
     int third = out->offsets[1] - out->offsets[0];
@@ -205,15 +215,6 @@ inline bool diatonicTriad(int root, int type, int degree, Triad* out) {
     else if (third == 4 && fifth == 8) out->quality = TriadQuality::Augmented;
     else                               out->quality = TriadQuality::Other;
     return true;
-}
-
-// Pad chords are voiced upward from the scale root placed in C3..B3.
-inline constexpr int kChordBaseKey = 48;
-inline constexpr int kChordVelocity = 100; // out of 127
-
-// MIDI keys for a triad of the scale rooted at `root`.
-inline void triadKeys(int root, const Triad& t, int keys[3]) {
-    for (int k = 0; k < 3; ++k) keys[k] = kChordBaseKey + root + t.offsets[k];
 }
 
 // Roman numeral: upper case for major/augmented, lower case for
@@ -228,31 +229,151 @@ inline std::string romanNumeral(int degree, TriadQuality q) {
     return s;
 }
 
-// ASCII chord symbol for file and clip names: "Bbm", "F#dim", "Ebaug".
-inline std::string triadAsciiName(const Triad& t) {
-    static const char* const names[12] = {
-        "C", "C#", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B",
-    };
-    std::string s = names[t.rootPc];
-    switch (t.quality) {
-        case TriadQuality::Minor:      s += "m"; break;
-        case TriadQuality::Diminished: s += "dim"; break;
-        case TriadQuality::Augmented:  s += "aug"; break;
-        default: break;
-    }
-    return s;
+// ------------------------------------------------------------
+// Pad chords: triad plus sus2 / sus4 / 7 / 9 variants
+// ------------------------------------------------------------
+
+// Order matches the GUI and the playChord callback.
+enum class ChordVariant { Triad, Sus2, Sus4, Seventh, Ninth };
+inline constexpr int kVariantCount = 5;
+inline constexpr int kMaxChordNotes = 5;
+
+// Pad chords are voiced upward from the scale root placed in C3..B3.
+inline constexpr int kChordBaseKey = 48;
+inline constexpr int kChordVelocity = 100; // out of 127
+
+struct Chord {
+    int offsets[kMaxChordNotes]; // semitones above the scale root, ascending
+    int count;
+    int rootPc;                  // absolute pitch class of the chord root
+    std::string name;            // display symbol, e.g. "B♭maj7", "F♯m7♭5"
+    std::string asciiName;       // file/clip-safe, e.g. "Bbmaj7", "F#m7b5"
+};
+
+namespace detail {
+
+struct Suffix {
+    const char* display;
+    const char* ascii;
+};
+
+inline Suffix triadSuffix(int third, int fifth) {
+    if (third == 4 && fifth == 7) return {"", ""};
+    if (third == 3 && fifth == 7) return {"m", "m"};
+    if (third == 3 && fifth == 6) return {"°", "dim"};
+    if (third == 4 && fifth == 8) return {"+", "aug"};
+    return {"?", "x"};
 }
 
-// Chord symbol such as "Gm", "F♯°" or "E♭+".
-inline std::string triadName(const Triad& t) {
-    std::string s = kShortNames[t.rootPc];
-    switch (t.quality) {
-        case TriadQuality::Minor:      s += "m"; break;
-        case TriadQuality::Diminished: s += "°"; break;
-        case TriadQuality::Augmented:  s += "+"; break;
-        default: break;
+struct SeventhSuffix {
+    int third, fifth, seventh;
+    Suffix seventhName;
+    Suffix ninthName;   // used when the ninth is major
+};
+
+// Every seventh chord the seven-note scales in kTypes can produce.
+inline constexpr SeventhSuffix kSevenths[] = {
+    {4, 7, 11, {"maj7",    "maj7"},    {"maj9",    "maj9"}},
+    {3, 7, 10, {"m7",      "m7"},      {"m9",      "m9"}},
+    {4, 7, 10, {"7",       "7"},       {"9",       "9"}},
+    {3, 6, 10, {"m7♭5",    "m7b5"},    {"m9♭5",    "m9b5"}},
+    {3, 6,  9, {"°7",      "dim7"},    {"°7(9)",   "dim7(9)"}},
+    {3, 7, 11, {"m(maj7)", "m(maj7)"}, {"m(maj9)", "m(maj9)"}},
+    {4, 8, 11, {"maj7♯5",  "maj7#5"},  {"maj9♯5",  "maj9#5"}},
+    {4, 8, 10, {"7♯5",     "7#5"},     {"9♯5",     "9#5"}},
+    {4, 6, 10, {"7♭5",     "7b5"},     {"9♭5",     "9b5"}},
+};
+
+inline const char* const kAsciiNames[12] = {
+    "C", "C#", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B",
+};
+
+} // namespace detail
+
+// Builds a pad chord on scale degree 0-6 from scale notes only:
+//   Triad    1-3-5
+//   Sus2     1-2-5, only if that is a real sus2 (major 2nd, perfect 5th)
+//   Sus4     1-4-5, only if that is a real sus4 (perfect 4th and 5th)
+//   Seventh  1-3-5-7
+//   Ninth    1-3-5-7-9
+// Returns false for scales without seven notes and for sus chords the
+// scale can't form on that degree (e.g. E sus2 or F sus4 in C major).
+inline bool diatonicChord(int root, int type, int degree, ChordVariant variant, Chord* out) {
+    if (root < 0 || root > 11 || degree < 0 || degree > 6) return false;
+    int steps[7];
+    if (!sevenNoteSteps(type, steps)) return false;
+
+    // Scale-note indices (relative to the chord root) for each variant.
+    static const int kTriad[]   = {0, 2, 4};
+    static const int kSus2[]    = {0, 1, 4};
+    static const int kSus4[]    = {0, 3, 4};
+    static const int kSeventh[] = {0, 2, 4, 6};
+    static const int kNinth[]   = {0, 2, 4, 6, 8};
+    const int* idx = kTriad;
+    int count = 3;
+    switch (variant) {
+        case ChordVariant::Triad:   idx = kTriad;   count = 3; break;
+        case ChordVariant::Sus2:    idx = kSus2;    count = 3; break;
+        case ChordVariant::Sus4:    idx = kSus4;    count = 3; break;
+        case ChordVariant::Seventh: idx = kSeventh; count = 4; break;
+        case ChordVariant::Ninth:   idx = kNinth;   count = 5; break;
     }
-    return s;
+
+    for (int k = 0; k < count; ++k) out->offsets[k] = stepOffset(steps, degree + idx[k]);
+    out->count = count;
+    out->rootPc = (root + out->offsets[0]) % 12;
+
+    // Intervals above the chord root.
+    int iv[kMaxChordNotes];
+    for (int k = 0; k < count; ++k) iv[k] = out->offsets[k] - out->offsets[0];
+
+    detail::Suffix suffix{"", ""};
+    std::string extraDisplay, extraAscii;
+    switch (variant) {
+        case ChordVariant::Triad:
+            suffix = detail::triadSuffix(iv[1], iv[2]);
+            break;
+        case ChordVariant::Sus2:
+            if (iv[1] != 2 || iv[2] != 7) return false;
+            suffix = {"sus2", "sus2"};
+            break;
+        case ChordVariant::Sus4:
+            if (iv[1] != 5 || iv[2] != 7) return false;
+            suffix = {"sus4", "sus4"};
+            break;
+        case ChordVariant::Seventh:
+        case ChordVariant::Ninth: {
+            const detail::SeventhSuffix* match = nullptr;
+            for (const auto& e : detail::kSevenths) {
+                if (e.third == iv[1] && e.fifth == iv[2] && e.seventh == iv[3]) match = &e;
+            }
+            if (!match) return false;
+            if (variant == ChordVariant::Seventh) {
+                suffix = match->seventhName;
+            } else {
+                int ninth = iv[4] - 12;
+                if (ninth == 2) {
+                    suffix = match->ninthName;
+                } else if (ninth == 1 || ninth == 3) {
+                    suffix = match->seventhName;
+                    extraDisplay = ninth == 1 ? "♭9" : "♯9";
+                    extraAscii   = ninth == 1 ? "b9" : "#9";
+                } else {
+                    return false;
+                }
+            }
+            break;
+        }
+    }
+
+    out->name      = std::string(kShortNames[out->rootPc]) + suffix.display + extraDisplay;
+    out->asciiName = std::string(detail::kAsciiNames[out->rootPc]) + suffix.ascii + extraAscii;
+    return true;
+}
+
+// MIDI keys for a pad chord of the scale rooted at `root`.
+inline void chordKeys(int root, const Chord& c, int keys[kMaxChordNotes]) {
+    for (int k = 0; k < c.count; ++k) keys[k] = kChordBaseKey + root + c.offsets[k];
 }
 
 } // namespace scale
