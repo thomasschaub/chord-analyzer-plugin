@@ -19,8 +19,6 @@ namespace {
 constexpr uint32_t kGuiWidth  = 440;
 constexpr uint32_t kGuiHeight = 480;
 constexpr int kHistorySize = 100;
-constexpr int kChordBaseKey = 48;      // scale root is voiced from C3..B3
-constexpr double kChordVelocity = 0.8;
 
 struct ChordAnalyzer {
     const clap_host_t* host = nullptr;
@@ -97,7 +95,7 @@ void onPlayChord(void* userData, int degree) {
     if (!scale::diatonicTriad(root, self->scaleType.load(), degree, &t)) return;
 
     std::lock_guard<std::mutex> lk(self->outMutex);
-    for (int k = 0; k < 3; ++k) self->padKeys[k] = kChordBaseKey + root + t.offsets[k];
+    scale::triadKeys(root, t, self->padKeys);
     self->padKeyCount = 3;
     self->padGen++;
 }
@@ -145,7 +143,7 @@ void pushNote(const clap_output_events_t* out, int key, bool on) {
     ev.port_index = 0;
     ev.channel    = 0;
     ev.key        = static_cast<int16_t>(key);
-    ev.velocity   = on ? kChordVelocity : 0.0;
+    ev.velocity   = on ? scale::kChordVelocity / 127.0 : 0.0;
     out->try_push(out, &ev.header);
 }
 

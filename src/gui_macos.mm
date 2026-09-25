@@ -6,6 +6,7 @@
 #include <cstring>
 
 #include "gui_api.h"
+#include "midi_file.hpp"
 #include "scale.hpp"
 
 static const int kRangeStart = 36; // C2
@@ -271,9 +272,11 @@ static inline bool isWhitePc(int pc) {
 @protocol ChordPadDelegate
 - (void)chordPadPressed:(ChordPadView*)pad;
 - (void)chordPadReleased:(ChordPadView*)pad;
+// A .mid file holding the pad's chord, or nil if there is nothing to drag.
+- (NSURL*)midiFileURLForChordPad:(ChordPadView*)pad;
 @end
 
-@interface ChordPadView : NSView
+@interface ChordPadView : NSView <NSDraggingSource>
 @property(nonatomic, assign) int degree;
 @property(nonatomic, copy)   NSString* numeral;
 @property(nonatomic, copy)   NSString* chordName;
@@ -282,7 +285,10 @@ static inline bool isWhitePc(int pc) {
 @property(nonatomic, weak)   id<ChordPadDelegate> delegate;
 @end
 
-@implementation ChordPadView
+@implementation ChordPadView {
+    NSPoint _mouseDownPoint;
+    BOOL _dragStarted;
+}
 
 - (BOOL)isFlipped { return YES; }
 
@@ -301,19 +307,56 @@ static inline bool isWhitePc(int pc) {
 }
 
 - (void)mouseDown:(NSEvent*)event {
-    (void)event;
     if (!self.enabled) return;
+    _mouseDownPoint = [self convertPoint:event.locationInWindow fromView:nil];
+    _dragStarted = NO;
     self.pressed = YES;
     [self setNeedsDisplay:YES];
     [self.delegate chordPadPressed:self];
 }
 
+- (void)mouseDragged:(NSEvent*)event {
+    if (!self.pressed || _dragStarted) return;
+    NSPoint p = [self convertPoint:event.locationInWindow fromView:nil];
+    if (std::hypot(p.x - _mouseDownPoint.x, p.y - _mouseDownPoint.y) < 4) return;
+
+    // Moving turns the click into a drag: stop the preview, hand out a .mid file.
+    _dragStarted = YES;
+    [self releasePad];
+
+    NSURL* url = [self.delegate midiFileURLForChordPad:self];
+    if (!url) return;
+
+    NSDraggingItem* item = [[NSDraggingItem alloc] initWithPasteboardWriter:url];
+    [item setDraggingFrame:self.bounds contents:[self snapshotImage]];
+    [self beginDraggingSessionWithItems:@[item] event:event source:self];
+}
+
 - (void)mouseUp:(NSEvent*)event {
     (void)event;
+    [self releasePad];
+}
+
+- (void)releasePad {
     if (!self.pressed) return;
     self.pressed = NO;
     [self setNeedsDisplay:YES];
     [self.delegate chordPadReleased:self];
+}
+
+- (NSImage*)snapshotImage {
+    NSBitmapImageRep* rep = [self bitmapImageRepForCachingDisplayInRect:self.bounds];
+    [self cacheDisplayInRect:self.bounds toBitmapImageRep:rep];
+    NSImage* img = [[NSImage alloc] initWithSize:self.bounds.size];
+    [img addRepresentation:rep];
+    return img;
+}
+
+- (NSDragOperation)draggingSession:(NSDraggingSession*)session
+    sourceOperationMaskForDraggingContext:(NSDraggingContext)context {
+    (void)session;
+    (void)context;
+    return NSDragOperationCopy;
 }
 
 - (void)drawRect:(NSRect)dirtyRect {
@@ -412,6 +455,25 @@ static inline bool isWhitePc(int pc) {
     return tf;
 }
 
++ (NSString*)dragFileRoot {
+    return [NSTemporaryDirectory() stringByAppendingPathComponent:@"ChordAnalyzer"];
+}
+
+// Drops drag files from earlier sessions. Anything under a day old is kept
+// in case a host reads the file lazily after the drop.
++ (void)removeStaleDragFiles {
+    NSFileManager* fm = [NSFileManager defaultManager];
+    NSString* root = ChordAnalyzerView.dragFileRoot;
+    NSDate* cutoff = [NSDate dateWithTimeIntervalSinceNow:-24 * 60 * 60];
+    for (NSString* entry in [fm contentsOfDirectoryAtPath:root error:nil]) {
+        NSString* path = [root stringByAppendingPathComponent:entry];
+        NSDate* modified = [fm attributesOfItemAtPath:path error:nil].fileModificationDate;
+        if (modified && [modified compare:cutoff] == NSOrderedAscending) {
+            [fm removeItemAtPath:path error:nil];
+        }
+    }
+}
+
 - (NSButton*)makeSmallButton:(NSString*)title action:(SEL)action {
     NSButton* btn = [NSButton buttonWithTitle:title target:self action:action];
     btn.bezelStyle = NSBezelStyleRounded;
@@ -478,6 +540,7 @@ static inline bool isWhitePc(int pc) {
             ChordPadView* pad = [[ChordPadView alloc] initWithFrame:NSZeroRect];
             pad.degree = d;
             pad.delegate = self;
+            pad.toolTip = @"Click to play, drag into your DAW as a MIDI clip";
             [self addSubview:pad];
             [pads addObject:pad];
         }
@@ -601,6 +664,37 @@ static inline bool isWhitePc(int pc) {
 - (void)chordPadReleased:(ChordPadView*)pad {
     (void)pad;
     if (self.callbacks.releaseChord) self.callbacks.releaseChord(self.callbacks.userData);
+}
+
+- (NSURL*)midiFileURLForChordPad:(ChordPadView*)pad {
+    int root = (int)self.rootPopup.indexOfSelectedItem;
+    int type = (int)self.scaleTypePopup.indexOfSelectedItem;
+    scale::Triad t;
+    if (!scale::diatonicTriad(root, type, pad.degree, &t)) return nil;
+
+    int keys[3];
+    scale::triadKeys(root, t, keys);
+    std::string name = scale::triadAsciiName(t);
+    std::vector<uint8_t> bytes =
+        midifile::chordFile(keys, 3, (uint8_t)scale::kChordVelocity, name);
+
+    // A fresh directory per drag keeps the file name clean ("Cm.mid", which
+    // hosts use as the clip name) without clobbering a file a host may
+    // still be reading from an earlier drag.
+    NSString* dir = [ChordAnalyzerView.dragFileRoot
+        stringByAppendingPathComponent:[NSUUID UUID].UUIDString];
+    NSError* err = nil;
+    if (![[NSFileManager defaultManager] createDirectoryAtPath:dir
+                                   withIntermediateDirectories:YES
+                                                    attributes:nil
+                                                         error:&err]) {
+        return nil;
+    }
+    NSString* path = [dir stringByAppendingPathComponent:
+                      [NSString stringWithFormat:@"%s.mid", name.c_str()]];
+    NSData* data = [NSData dataWithBytes:bytes.data() length:bytes.size()];
+    if (![data writeToFile:path atomically:YES]) return nil;
+    return [NSURL fileURLWithPath:path];
 }
 
 - (void)scaleSelectionChanged:(id)sender {
@@ -742,6 +836,7 @@ void* chordGuiCreate(uint32_t w, uint32_t h, ChordGuiCallbacks callbacks) {
         NSRect frame = NSMakeRect(0, 0, w, h);
         ChordAnalyzerView* view = [[ChordAnalyzerView alloc] initWithFrame:frame];
         [view startPollingWithCallbacks:callbacks];
+        [ChordAnalyzerView removeStaleDragFiles];
         return (__bridge_retained void*)view;
     }
 }

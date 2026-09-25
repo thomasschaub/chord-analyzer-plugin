@@ -207,6 +207,15 @@ inline bool diatonicTriad(int root, int type, int degree, Triad* out) {
     return true;
 }
 
+// Pad chords are voiced upward from the scale root placed in C3..B3.
+inline constexpr int kChordBaseKey = 48;
+inline constexpr int kChordVelocity = 100; // out of 127
+
+// MIDI keys for a triad of the scale rooted at `root`.
+inline void triadKeys(int root, const Triad& t, int keys[3]) {
+    for (int k = 0; k < 3; ++k) keys[k] = kChordBaseKey + root + t.offsets[k];
+}
+
 // Roman numeral: upper case for major/augmented, lower case for
 // minor/diminished, e.g. "V", "ii", "vii°", "III+".
 inline std::string romanNumeral(int degree, TriadQuality q) {
@@ -216,6 +225,21 @@ inline std::string romanNumeral(int degree, TriadQuality q) {
     std::string s = minorish ? lower[degree] : upper[degree];
     if (q == TriadQuality::Diminished) s += "°";
     if (q == TriadQuality::Augmented)  s += "+";
+    return s;
+}
+
+// ASCII chord symbol for file and clip names: "Bbm", "F#dim", "Ebaug".
+inline std::string triadAsciiName(const Triad& t) {
+    static const char* const names[12] = {
+        "C", "C#", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B",
+    };
+    std::string s = names[t.rootPc];
+    switch (t.quality) {
+        case TriadQuality::Minor:      s += "m"; break;
+        case TriadQuality::Diminished: s += "dim"; break;
+        case TriadQuality::Augmented:  s += "aug"; break;
+        default: break;
+    }
     return s;
 }
 
