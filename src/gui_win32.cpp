@@ -851,12 +851,16 @@ bool applyScale(View* v, int root, int type) {
     bool changed = root != v->curRoot || type != v->curType;
     v->curRoot = root;
     v->curType = type;
-    if (v->rootCombo && SendMessageW(v->rootCombo, CB_GETCURSEL, 0, 0) != root) {
-        SendMessageW(v->rootCombo, CB_SETCURSEL, root, 0);
-    }
-    if (v->typeCombo && SendMessageW(v->typeCombo, CB_GETCURSEL, 0, 0) != type) {
-        SendMessageW(v->typeCombo, CB_SETCURSEL, type, 0);
-    }
+    // An open list moves its selection with the mouse before committing
+    // anything; resetting it from the poll would yank the hover highlight.
+    auto syncCombo = [](HWND combo, int index) {
+        if (!combo || SendMessageW(combo, CB_GETDROPPEDSTATE, 0, 0)) return;
+        if (SendMessageW(combo, CB_GETCURSEL, 0, 0) != index) {
+            SendMessageW(combo, CB_SETCURSEL, index, 0);
+        }
+    };
+    syncCombo(v->rootCombo, root);
+    syncCombo(v->typeCombo, type);
     if (v->rootCombo && (IsWindowEnabled(v->rootCombo) != FALSE) != (type != 0)) {
         EnableWindow(v->rootCombo, type != 0);
     }
