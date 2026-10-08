@@ -35,7 +35,16 @@ struct ChordGuiCallbacks {
 
 void* chordGuiCreate(uint32_t w, uint32_t h, ChordGuiCallbacks callbacks);
 void  chordGuiDestroy(void* view);
-bool  chordGuiSetParent(void* view, void* parentNSView);
+// parent is an NSView* on macOS and an HWND on Windows.
+bool  chordGuiSetParent(void* view, void* parent);
 void  chordGuiGetPreferredSize(uint32_t* w, uint32_t* h);
+
+#if defined(_WIN32)
+// Windows hosts size the editor in physical pixels: the view is w x h
+// logical units drawn at `scale` pixels per unit.
+void   chordGuiSetScale(void* view, double scale);
+// Scale of the primary monitor, for hosts that never call set_scale.
+double chordGuiSystemScale();
+#endif
 
 }

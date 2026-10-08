@@ -15,7 +15,8 @@
 #include "chord_detector.hpp"
 #include "scale.hpp"
 
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(_WIN32)
+#define CHORD_HAS_GUI 1
 #include "gui_api.h"
 #endif
 
@@ -72,11 +73,13 @@ struct ChordAnalyzer {
 
     void* guiView = nullptr;
     bool guiVisible = false;
+    double guiScale = 1.0; // Windows only; Cocoa sizes are in points
+
 
     clap_plugin_t plugin{};
 };
 
-#if defined(__APPLE__)
+#if CHORD_HAS_GUI
 void fillChordSnapshot(void* userData, ChordSnapshot* out) {
     if (!out) return;
     std::memset(out, 0, sizeof(*out));
@@ -466,6 +469,8 @@ constexpr clap_plugin_state_t kState = { state_save, state_load };
 
 #if defined(__APPLE__)
 constexpr const char* kNativeGuiApi = CLAP_WINDOW_API_COCOA;
+#elif defined(_WIN32)
+constexpr const char* kNativeGuiApi = CLAP_WINDOW_API_WIN32;
 #else
 constexpr const char* kNativeGuiApi = "";
 #endif
@@ -484,7 +489,7 @@ bool gui_get_preferred_api(const clap_plugin_t*, const char** api, bool* is_floa
 bool gui_create(const clap_plugin_t* p, const char* api, bool is_floating) {
     if (is_floating) return false;
     if (std::strcmp(api, kNativeGuiApi) != 0) return false;
-#if defined(__APPLE__)
+#if CHORD_HAS_GUI
     auto* self = static_cast<ChordAnalyzer*>(p->plugin_data);
     if (!self->guiView) {
         ChordGuiCallbacks cb{};
@@ -496,6 +501,11 @@ bool gui_create(const clap_plugin_t* p, const char* api, bool is_floating) {
         cb.releaseChord = &onReleaseChord;
         self->guiView = chordGuiCreate(kGuiWidth, kGuiHeight, cb);
         if (!self->guiView) return false;
+#if defined(_WIN32)
+        // Until the host calls set_scale (some never do).
+        self->guiScale = chordGuiSystemScale();
+        chordGuiSetScale(self->guiView, self->guiScale);
+#endif
     }
     return true;
 #else
@@ -506,7 +516,7 @@ bool gui_create(const clap_plugin_t* p, const char* api, bool is_floating) {
 
 void gui_destroy(const clap_plugin_t* p) {
     auto* self = static_cast<ChordAnalyzer*>(p->plugin_data);
-#if defined(__APPLE__)
+#if CHORD_HAS_GUI
     if (self->guiView) {
         chordGuiDestroy(self->guiView);
         self->guiView = nullptr;
@@ -517,11 +527,27 @@ void gui_destroy(const clap_plugin_t* p) {
     self->guiVisible = false;
 }
 
-bool gui_set_scale(const clap_plugin_t*, double) { return true; }
+bool gui_set_scale(const clap_plugin_t* p, double scale) {
+#if defined(_WIN32)
+    auto* self = static_cast<ChordAnalyzer*>(p->plugin_data);
+    if (!(scale > 0)) return false;
+    self->guiScale = scale;
+    if (self->guiView) chordGuiSetScale(self->guiView, scale);
+#else
+    (void)p; (void)scale;
+#endif
+    return true;
+}
 
-bool gui_get_size(const clap_plugin_t*, uint32_t* w, uint32_t* h) {
-    *w = kGuiWidth;
-    *h = kGuiHeight;
+// Editor size in the host's units: points on macOS, physical pixels on Windows.
+void guiSize(const clap_plugin_t* p, uint32_t* w, uint32_t* h) {
+    double s = static_cast<ChordAnalyzer*>(p->plugin_data)->guiScale;
+    *w = static_cast<uint32_t>(kGuiWidth * s + 0.5);
+    *h = static_cast<uint32_t>(kGuiHeight * s + 0.5);
+}
+
+bool gui_get_size(const clap_plugin_t* p, uint32_t* w, uint32_t* h) {
+    guiSize(p, w, h);
     return true;
 }
 
@@ -529,19 +555,22 @@ bool gui_can_resize(const clap_plugin_t*) { return false; }
 
 bool gui_get_resize_hints(const clap_plugin_t*, clap_gui_resize_hints_t*) { return false; }
 
-bool gui_adjust_size(const clap_plugin_t*, uint32_t* w, uint32_t* h) {
-    *w = kGuiWidth;
-    *h = kGuiHeight;
+bool gui_adjust_size(const clap_plugin_t* p, uint32_t* w, uint32_t* h) {
+    guiSize(p, w, h);
     return true;
 }
 
 bool gui_set_size(const clap_plugin_t*, uint32_t, uint32_t) { return true; }
 
 bool gui_set_parent(const clap_plugin_t* p, const clap_window_t* window) {
-#if defined(__APPLE__)
+#if CHORD_HAS_GUI
     auto* self = static_cast<ChordAnalyzer*>(p->plugin_data);
     if (!self->guiView || !window) return false;
+#if defined(_WIN32)
+    return chordGuiSetParent(self->guiView, window->win32);
+#else
     return chordGuiSetParent(self->guiView, window->cocoa);
+#endif
 #else
     (void)p; (void)window;
     return false;
@@ -666,7 +695,7 @@ const void* entry_get_factory(const char* factory_id) {
 } // namespace
 
 extern "C" {
-CLAP_EXPORT const clap_plugin_entry_t clap_entry = {
+CLAP_EXPORT extern const clap_plugin_entry_t clap_entry = {
     CLAP_VERSION_INIT,
     entry_init,
     entry_deinit,

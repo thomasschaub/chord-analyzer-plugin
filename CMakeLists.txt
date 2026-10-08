@@ -25,6 +25,8 @@ set(PLUGIN_SOURCES
 
 if(APPLE)
     list(APPEND PLUGIN_SOURCES src/gui_macos.mm)
+elseif(WIN32)
+    list(APPEND PLUGIN_SOURCES src/gui_win32.cpp)
 endif()
 
 add_library(chord-analyzer MODULE ${PLUGIN_SOURCES})
@@ -71,4 +73,12 @@ if(WIN32)
         SUFFIX ".clap"
         OUTPUT_NAME "ChordAnalyzer"
     )
+    target_compile_definitions(chord-analyzer PRIVATE
+        UNICODE _UNICODE NOMINMAX _WIN32_WINNT=0x0601)
+    target_link_libraries(chord-analyzer PRIVATE
+        d2d1 dwrite comctl32 ole32 shell32 uuid)
+    if(MINGW)
+        # Hosts won't have the MinGW runtime DLLs next to them.
+        target_link_options(chord-analyzer PRIVATE -static)
+    endif()
 endif()
